@@ -47,6 +47,25 @@ var (
 	}
 )
 
+// 安全分割OS信息函数
+func safeSplitOSInfo(osInfo string) (hostName, userName, processName string) {
+	if osInfo == "" {
+		return "Unknown", "Unknown", "Unknown"
+	}
+
+	parts := strings.SplitN(osInfo, "\t", 3)
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		return parts[0], parts[1], "Unknown"
+	case 1:
+		return parts[0], "Unknown", "Unknown"
+	default:
+		return "Unknown", "Unknown", "Unknown"
+	}
+}
+
 // Add 添加客户端
 func (cm *HTTPClientManager) Add(uid string, sleepTime int) *HTTPClient {
 	cm.mu.Lock()
@@ -131,7 +150,7 @@ func (c *HTTPClient) Stop() {
 func (c *HTTPClient) startHeartbeatCheck() {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("HTTP heartbeat checker panic recovered:", r)
+			logger.Error("HTTP heartbeat checker panic recovered:", r, "client:", c.UID)
 		}
 	}()
 
@@ -177,23 +196,13 @@ func (c *HTTPClient) startHeartbeatCheck() {
 // GetHttp HTTP GET处理函数
 func GetHttp(w http.ResponseWriter, r *http.Request) {
 	// 记录请求开始时间
-	//startTime := time.Now()
+	startTime := time.Now()
 	requestID := uuid.New().String()
 
-	// 设置响应头
-	w.Header().Set("Content-Type", "application/json")
-
-	// 记录请求信息
-	//logger.Info("HTTP GET request started:",
-	//	"RequestID:", requestID,
-	//	"RemoteAddr:", r.RemoteAddr,
-	//	"UserAgent:", r.UserAgent(),
-	//)
-
-	// 确保响应始终返回
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("HTTP GET handler panic recovered:", r, "RequestID:", requestID)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{
 				"error": "Internal server error",
@@ -201,11 +210,21 @@ func GetHttp(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 记录请求处理时间
-		//logger.Info("HTTP GET request completed:",
-		//	"RequestID:", requestID,
-		//	"Duration:", time.Since(startTime),
-		//)
+		logger.Debug("HTTP GET request completed:",
+			"RequestID:", requestID,
+			"Duration:", time.Since(startTime),
+		)
 	}()
+
+	// 设置响应头
+	w.Header().Set("Content-Type", "application/json")
+
+	// 记录请求信息
+	logger.Debug("HTTP GET request started:",
+		"RequestID:", requestID,
+		"RemoteAddr:", r.RemoteAddr,
+		"UserAgent:", r.UserAgent(),
+	)
 
 	// 获取Cookie
 	cookieValue := r.Header.Get("Cookie")
@@ -229,13 +248,33 @@ func GetHttp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 验证元数据长度
+	if len(encryptMetainfo) == 0 {
+		logger.Warn("Empty metadata", "RequestID:", requestID)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Empty metadata",
+		})
+		return
+	}
+
 	// 解码和解析元数据
 	metainfo, uid, err := parseMetadata(encryptMetainfo)
 	if err != nil {
 		logger.Error("Failed to parse metadata:", err, "RequestID:", requestID)
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{
 			"error": "Invalid metadata",
+		})
+		return
+	}
+
+	// 验证UID
+	if len(uid) == 0 {
+		logger.Error("Invalid UID generated", "RequestID:", requestID)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Internal server error",
 		})
 		return
 	}
@@ -280,6 +319,10 @@ func GetHttp(w http.ResponseWriter, r *http.Request) {
 
 // parseMetadata 解析元数据
 func parseMetadata(encryptMetainfo string) ([]byte, string, error) {
+	if len(encryptMetainfo) == 0 {
+		return nil, "", fmt.Errorf("empty encryptMetainfo")
+	}
+
 	tmpMetainfo, err := encrypt.DecodeBase64([]byte(encryptMetainfo))
 	if err != nil {
 		return nil, "", fmt.Errorf("decode base64 failed: %w", err)
@@ -290,12 +333,22 @@ func parseMetadata(encryptMetainfo string) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("decrypt failed: %w", err)
 	}
 
+	// 验证metainfo长度
+	if len(metainfo) < 9 {
+		return nil, "", fmt.Errorf("metainfo too short: %d bytes", len(metainfo))
+	}
+
 	uid := encrypt.BytesToMD5(metainfo)
 	return metainfo, uid, nil
 }
 
 // handleFirstBlood 处理首次连接
 func handleFirstBlood(uid string, metainfo []byte, r *http.Request) error {
+	// 验证metainfo长度
+	if len(metainfo) < 9 {
+		return fmt.Errorf("metainfo too short: %d bytes", len(metainfo))
+	}
+
 	// 设置连接类型
 	connection.MuClientListenerType.Lock()
 	connection.ClientListenerType[uid] = "web"
@@ -356,7 +409,7 @@ func handleFirstBlood(uid string, metainfo []byte, r *http.Request) error {
 	}
 
 	// 发送Webhook通知
-	if exits, key := webhooks.CheckEnable(); exits {
+	if exists, key := webhooks.CheckEnable(); exists {
 		webhooks.SendWecom(*client, key)
 	}
 
@@ -383,23 +436,29 @@ type ClientInfo struct {
 // parseClientInfo 解析客户端信息
 func parseClientInfo(metainfo []byte, r *http.Request) (*ClientInfo, error) {
 	if len(metainfo) < 9 {
-		return nil, fmt.Errorf("metainfo too short")
+		return nil, fmt.Errorf("metainfo too short: %d bytes", len(metainfo))
 	}
 
+	// 安全解析
 	processID := binary.BigEndian.Uint32(metainfo[:4])
-	flag := int(metainfo[4:5][0])
+	flag := int(metainfo[4])
+
+	// 验证是否有足够字节解析IP
+	if len(metainfo) < 9 {
+		return nil, fmt.Errorf("metainfo insufficient for IP parsing: %d bytes", len(metainfo))
+	}
+
 	ipInt := binary.LittleEndian.Uint32(metainfo[5:9])
 	localIP := utils.Uint32ToIP(ipInt).String()
-	osInfo := string(metainfo[9:])
 
-	osArray := strings.Split(osInfo, "\t")
-	if len(osArray) < 3 {
-		return nil, fmt.Errorf("invalid os info format")
+	// 安全获取osInfo
+	var osInfo string
+	if len(metainfo) > 9 {
+		osInfo = string(metainfo[9:])
 	}
 
-	hostName := osArray[0]
-	userName := osArray[1]
-	processName := osArray[2]
+	// 使用安全分割函数
+	hostName, userName, processName := safeSplitOSInfo(osInfo)
 
 	// 获取外网IP
 	externalIp, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -408,6 +467,12 @@ func parseClientInfo(metainfo []byte, r *http.Request) (*ClientInfo, error) {
 	}
 	if externalIp == "::1" {
 		externalIp = "127.0.0.1"
+	}
+
+	// 验证IP地址
+	if net.ParseIP(externalIp) == nil {
+		logger.Warn("Invalid external IP:", externalIp)
+		externalIp = "0.0.0.0"
 	}
 
 	// 获取地理位置
@@ -456,6 +521,12 @@ func handlePullCommands(uid string, clientRecord *database.Clients, w http.Respo
 	cmdBytes, ok := command.CommandQueues.GetCommand(uid)
 
 	if ok && len(cmdBytes) > 0 {
+		// 验证命令长度
+		if len(cmdBytes) > 10*1024*1024 { // 10MB限制
+			logger.Error("Command too large:", len(cmdBytes), "uid:", uid)
+			cmdBytes = []byte("Error: Command too large")
+		}
+
 		// 有命令需要执行
 		cmdBytes, err := encrypt.Encrypt(cmdBytes)
 		if err != nil {

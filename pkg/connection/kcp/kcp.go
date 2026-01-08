@@ -55,6 +55,25 @@ var (
 	}
 )
 
+// 安全分割OS信息函数
+func safeSplitOSInfo(osInfo string) (hostName, userName, processName string) {
+	if osInfo == "" {
+		return "Unknown", "Unknown", "Unknown"
+	}
+
+	parts := strings.SplitN(osInfo, "\t", 3)
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		return parts[0], parts[1], "Unknown"
+	case 1:
+		return parts[0], "Unknown", "Unknown"
+	default:
+		return "Unknown", "Unknown", "Unknown"
+	}
+}
+
 // Add 添加客户端到管理器
 func (cm *KCPClientManager) Add(uid string, client *KCPClient) {
 	cm.Mu.Lock()
@@ -141,6 +160,10 @@ func (c *KCPClient) Write(data []byte) error {
 		return fmt.Errorf("connection closed")
 	}
 
+	if len(data) == 0 {
+		return fmt.Errorf("empty data to write")
+	}
+
 	c.Session.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_, err := c.Session.Write(data)
 	return err
@@ -148,6 +171,10 @@ func (c *KCPClient) Write(data []byte) error {
 
 // WriteWithLength 发送带长度的消息
 func (c *KCPClient) WriteWithLength(data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty data to write")
+	}
+
 	// 创建带长度的消息
 	length := uint32(len(data))
 	buf := make([]byte, 4+len(data))
@@ -161,7 +188,7 @@ func (c *KCPClient) WriteWithLength(data []byte) error {
 func (c *KCPClient) startHeartbeatCheck() {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("KCP heartbeat checker panic recovered:", r)
+			logger.Error("KCP heartbeat checker panic recovered:", r, "client:", c.UID)
 		}
 	}()
 
@@ -175,18 +202,6 @@ func (c *KCPClient) startHeartbeatCheck() {
 				return
 			}
 
-			// 检查KCP连接状态
-			//stats := c.Session.GetStats()
-			//logger.Debug("KCP stats for client:", c.UID,
-			//	"BytesSent:", stats.BytesSent,
-			//	"BytesReceived:", stats.BytesReceived,
-			//	"MaxConn:", stats.MaxConn,
-			//	"ActiveOpens:", stats.ActiveOpens,
-			//	"PassiveOpens:", stats.PassiveOpens,
-			//	"CurrEstab:", stats.CurrEstab,
-			//	"InErrs:", stats.InErrs,
-			//)
-
 			// 检查心跳是否超时
 			if time.Since(c.LastHeartbeat) > 30*time.Second {
 				c.TimeoutCount++
@@ -197,14 +212,6 @@ func (c *KCPClient) startHeartbeatCheck() {
 					c.Close()
 					return
 				}
-			}
-
-			// 可选：发送心跳检查包
-			if c.TimeoutCount > 0 {
-				heartbeatMsg := make([]byte, 8)
-				binary.BigEndian.PutUint32(heartbeatMsg[:4], 3) // 心跳类型
-				binary.BigEndian.PutUint32(heartbeatMsg[4:], 0) // 空内容
-				c.Write(heartbeatMsg)
 			}
 
 		case <-c.StopChan:
@@ -218,13 +225,19 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 	remoteAddr := session.RemoteAddr()
 	logger.Info("New KCP connection from:", remoteAddr)
 
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("KCP handler panic recovered:", r, "from:", remoteAddr)
+		}
+	}()
+
 	// 创建客户端对象
 	client := &KCPClient{
 		Session:       session,
 		StopChan:      make(chan struct{}),
 		LastHeartbeat: time.Now(),
 		IsClosed:      false,
-		Reader:        bufio.NewReader(session),
+		Reader:        bufio.NewReaderSize(session, 1024*1024), // 增加缓冲区大小
 	}
 
 	defer func() {
@@ -237,7 +250,7 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 	session.SetStreamMode(true)
 	session.SetWindowSize(1024, 1024)
 	session.SetNoDelay(1, 10, 2, 1)
-	session.SetDeadline(time.Now().Add(60 * time.Second))
+	session.SetDeadline(time.Now().Add(30 * time.Second)) // 缩短超时时间
 
 	// 主消息处理循环
 	for {
@@ -246,7 +259,7 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 		}
 
 		// 重置读取超时
-		session.SetReadDeadline(time.Now().Add(60 * time.Second))
+		session.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		// 读取消息长度
 		var length uint32
@@ -254,7 +267,7 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 		if err != nil {
 			if err == io.EOF {
 				logger.Info("KCP client closed connection:", remoteAddr)
-			} else if strings.Contains(err.Error(), "i/o timeout") {
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				logger.Info("KCP read timeout for:", remoteAddr)
 				continue
 			} else {
@@ -264,50 +277,75 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 		}
 
 		// 验证消息长度
-		if length > 10*1024*1024 { // 限制为10MB
-			logger.Error("KCP message too large:", length, "from:", remoteAddr)
-			break
-		}
-
 		if length == 0 {
 			logger.Warn("KCP received zero-length message from:", remoteAddr)
 			continue
 		}
 
+		if length > 10*1024*1024 { // 限制为10MB
+			logger.Error("KCP message too large:", length, "from:", remoteAddr)
+			break
+		}
+
+		// 最小长度检查（至少需要4字节的消息类型）
+		if length < 4 {
+			logger.Error("KCP message length too short:", length, "from:", remoteAddr)
+			break
+		}
+
 		// 读取消息内容
 		message := make([]byte, length)
-		_, err = io.ReadFull(client.Reader, message)
+		bytesRead, err := io.ReadFull(client.Reader, message)
 		if err != nil {
 			if err == io.EOF {
 				logger.Info("KCP client closed connection while reading:", remoteAddr)
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				logger.Info("KCP read content timeout for:", remoteAddr)
 			} else {
 				logger.Error("KCP error reading message content:", err, "from:", remoteAddr)
 			}
 			break
 		}
 
-		// 处理消息
-		if len(message) < 4 {
-			logger.Error("KCP message too short from:", remoteAddr)
-			continue
+		// 验证实际读取的字节数
+		if uint32(bytesRead) != length {
+			logger.Error("KCP message length mismatch, expected:", length, "actual:", bytesRead)
+			break
 		}
 
-		msgTypeBytes := message[:4]
-		msgType := binary.BigEndian.Uint32(msgTypeBytes)
+		// 解析消息类型 - 添加边界检查
+		msgType := binary.BigEndian.Uint32(message[:4])
 
+		// 处理消息
 		switch msgType {
 		case 1: // firstBlood
+			if len(message) < 5 { // 至少需要类型+1字节数据
+				logger.Error("KCP firstBlood message too short from:", remoteAddr)
+				break
+			}
+
 			msg := message[4:]
+			if len(msg) == 0 {
+				logger.Error("KCP empty firstBlood payload from:", remoteAddr)
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(msg)
 			if err != nil {
-				logger.Error("KCP DecodeBase64 failed:", err)
-				continue
+				logger.Error("KCP DecodeBase64 failed:", err, "from:", remoteAddr)
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
-				logger.Error("KCP Decrypt failed:", err)
-				continue
+				logger.Error("KCP Decrypt failed:", err, "from:", remoteAddr)
+				break
+			}
+
+			// 验证metainfo长度
+			if len(metainfo) < 9 {
+				logger.Error("KCP metainfo too short:", len(metainfo), "from:", remoteAddr)
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -331,26 +369,48 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 			exists, _ := database.Engine.Where("uid = ?", uid).Get(&existingClient)
 
 			if !exists { // FirstBlood
+				if len(metainfo) < 9 {
+					logger.Error("KCP metainfo too short for parsing from:", remoteAddr)
+					break
+				}
+
 				processID := binary.BigEndian.Uint32(metainfo[:4])
-				flag := int(metainfo[4:5][0])
+				flag := int(metainfo[4])
+
+				// 检查是否有足够字节解析IP
+				if len(metainfo) < 9 {
+					logger.Error("KCP metainfo insufficient for IP parsing from:", remoteAddr)
+					break
+				}
+
 				ipInt := binary.LittleEndian.Uint32(metainfo[5:9])
 				localIP := utils.Uint32ToIP(ipInt).String()
-				osInfo := string(metainfo[9:])
 
-				osArray := strings.Split(osInfo, "\t")
-				hostName := osArray[0]
-				UserName := osArray[1]
-				processName := osArray[2]
+				// 安全地获取osInfo
+				var osInfo string
+				if len(metainfo) > 9 {
+					osInfo = string(metainfo[9:])
+				}
+
+				// 使用安全分割函数
+				hostName, UserName, processName := safeSplitOSInfo(osInfo)
 
 				// 获取外网IP
-				remoteAddr := session.RemoteAddr().String()
-				externalIp, _, err := net.SplitHostPort(remoteAddr)
+				remoteAddrStr := session.RemoteAddr().String()
+				externalIp, _, err := net.SplitHostPort(remoteAddrStr)
 				if err != nil {
-					externalIp = remoteAddr
+					externalIp = remoteAddrStr
 				}
 				if externalIp == "::1" {
 					externalIp = "127.0.0.1"
 				}
+
+				// 验证IP地址
+				if net.ParseIP(externalIp) == nil {
+					logger.Error("KCP invalid external IP:", externalIp, "from:", remoteAddr)
+					externalIp = "0.0.0.0"
+				}
+
 				address, _ := qqwry.GetLocationByIP(externalIp)
 
 				currentTime := time.Now()
@@ -365,6 +425,17 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 				}
 				if flag > 4 {
 					arch = "x64"
+				}
+
+				// 验证数据有效性
+				if processName == "" {
+					processName = "Unknown"
+				}
+				if hostName == "" {
+					hostName = "Unknown"
+				}
+				if UserName == "" {
+					UserName = "Unknown"
 				}
 
 				// 创建新客户端记录
@@ -385,14 +456,36 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 					Color:      "",
 				}
 
-				// 插入数据库
-				if _, err := database.Engine.Insert(&c); err != nil {
-					logger.Error("KCP failed to insert client:", err)
+				// 使用事务插入数据库
+				sessionDB := database.Engine.NewSession()
+				defer sessionDB.Close()
+
+				if err := sessionDB.Begin(); err != nil {
+					logger.Error("KCP failed to start transaction:", err)
+					break
 				}
 
-				// 插入相关表
-				database.Engine.Insert(&database.Shell{Uid: uid, ShellContent: ""})
-				database.Engine.Insert(&database.Notes{Uid: uid, Note: ""})
+				if _, err := sessionDB.Insert(&c); err != nil {
+					sessionDB.Rollback()
+					logger.Error("KCP failed to insert client:", err)
+					break
+				}
+
+				if _, err := sessionDB.Insert(&database.Shell{Uid: uid, ShellContent: ""}); err != nil {
+					sessionDB.Rollback()
+					logger.Error("KCP failed to insert shell:", err)
+					break
+				}
+
+				if _, err := sessionDB.Insert(&database.Notes{Uid: uid, Note: ""}); err != nil {
+					sessionDB.Rollback()
+					logger.Error("KCP failed to insert notes:", err)
+					break
+				}
+
+				if err := sessionDB.Commit(); err != nil {
+					logger.Error("KCP failed to commit transaction:", err)
+				}
 
 				// 发送Webhook通知
 				if exists, key := webhooks.CheckEnable(); exists {
@@ -402,36 +495,56 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 				logger.Info("New KCP client registered:", uid, "IP:", externalIp)
 			} else {
 				// 更新在线状态
-				database.Engine.Where("uid = ?", uid).Update(&database.Clients{Online: "1"})
+				if _, err := database.Engine.Where("uid = ?", uid).Update(&database.Clients{Online: "1"}); err != nil {
+					logger.Error("KCP failed to update client status:", err)
+				}
 				logger.Info("KCP client reconnected:", uid)
 			}
 
 		case 2: // otherMsg
+			if len(message) < 8 { // 至少需要类型+4字节长度+部分数据
+				logger.Error("KCP otherMsg message too short from:", remoteAddr)
+				break
+			}
+
 			msg := message[4:]
 			if len(msg) < 4 {
 				logger.Error("KCP OtherMsg too short")
-				continue
+				break
 			}
 
 			metaLen := binary.BigEndian.Uint32(msg[:4])
-			if len(msg) < int(4+metaLen) {
-				logger.Error("KCP invalid meta length")
-				continue
+
+			// 验证metaLen的合理性
+			if metaLen > uint32(len(msg)-4) {
+				logger.Error("KCP invalid meta length:", metaLen, "available:", len(msg)-4)
+				break
+			}
+
+			if metaLen == 0 {
+				logger.Error("KCP zero meta length")
+				break
 			}
 
 			metaMsg := msg[4 : 4+metaLen]
 			realMsg := msg[4+metaLen:]
 
+			// 验证realMsg不为空
+			if len(realMsg) == 0 {
+				logger.Error("KCP empty real message")
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(metaMsg)
 			if err != nil {
 				logger.Error("KCP DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
 				logger.Error("KCP Decrypt failed:", err)
-				continue
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -439,30 +552,31 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 			// 检查客户端是否在线
 			if _, exists := globalKCPClientManager.Get(uid); !exists {
 				logger.Warn("KCP received message from offline client:", uid)
-				continue
+				break
 			}
 
 			dataBytes, err := encrypt.DecodeBase64(realMsg)
 			if err != nil {
 				logger.Error("KCP DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			dataBytes, err = encrypt.Decrypt(dataBytes)
 			if err != nil {
 				logger.Error("KCP first decrypt failed:", err)
-				continue
+				break
 			}
 
 			dataBytes, err = encrypt.Decrypt(dataBytes)
 			if err != nil {
 				logger.Error("KCP second decrypt failed:", err)
-				continue
+				break
 			}
 
+			// 严格检查dataBytes长度
 			if len(dataBytes) < 4 {
-				logger.Error("KCP decrypted data too short")
-				continue
+				logger.Error("KCP decrypted data too short:", len(dataBytes))
+				break
 			}
 
 			replyTypeBytes := dataBytes[:4]
@@ -473,31 +587,70 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 			case 0: // 命令行展示
 				var shell database.Shell
 				if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-					shell.ShellContent += string(data) + "\n"
-					database.Engine.Where("uid = ?", uid).Update(&shell)
+					// 限制数据长度，防止过大的日志
+					var content string
+					if len(data) > 10000 {
+						content = string(data[:10000]) + "\n[Data truncated...]"
+					} else {
+						content = string(data) + "\n"
+					}
+
+					shell.ShellContent += content
+					if _, err := database.Engine.Where("uid = ?", uid).Update(&shell); err != nil {
+						logger.Error("KCP failed to update shell:", err)
+					}
 				}
 
 			case 31: // 错误展示
 				var shell database.Shell
 				if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-					shell.ShellContent += "!Error: " + string(data) + "\n"
-					database.Engine.Where("uid = ?", uid).Update(&shell)
+					// 限制数据长度，防止过大的日志
+					var content string
+					if len(data) > 10000 {
+						content = string(data[:10000]) + "\n[Data truncated...]"
+					} else {
+						content = string(data)
+					}
+
+					shell.ShellContent += "!Error: " + content + "\n"
+					if _, err := database.Engine.Where("uid = ?", uid).Update(&shell); err != nil {
+						logger.Error("KCP failed to update shell:", err)
+					}
 				}
 
 			case command.PS:
-				command.VarPidQueue.Add(uid, string(data))
+				if len(data) > 0 {
+					command.VarPidQueue.Add(uid, string(data))
+				}
 
 			case command.FileBrowse:
-				command.VarFileBrowserQueue.Add(uid, string(data))
+				if len(data) > 0 {
+					command.VarFileBrowserQueue.Add(uid, string(data))
+				}
 
 			case 22: // 文件下载第一条信息
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节长度+部分路径
 					logger.Error("KCP file download info too short")
 					break
 				}
 
 				fileLen := int(binary.BigEndian.Uint32(data[:4]))
+				if len(data) < 5 { // 至少4字节长度+1字节路径
+					logger.Error("KCP no file path in download info")
+					break
+				}
+
 				filePath := string(data[4:])
+				if filePath == "" {
+					logger.Error("KCP empty file path")
+					break
+				}
+
+				// 验证文件长度合理性
+				if fileLen <= 0 {
+					logger.Error("KCP invalid file length:", fileLen)
+					break
+				}
 
 				// 使用安全路径函数
 				fullPath, err := utils.GetSafeFilePath(uid, filePath)
@@ -541,7 +694,7 @@ WHERE uid = ? AND file_path = ?;
 				fp.Close()
 
 			case command.DOWNLOAD: // 文件下载
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
 					logger.Error("KCP download data too short")
 					break
 				}
@@ -549,6 +702,11 @@ WHERE uid = ? AND file_path = ?;
 				filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 				if len(data) < 4+filePathLen {
 					logger.Error("KCP invalid file path length in download")
+					break
+				}
+
+				if filePathLen == 0 {
+					logger.Error("KCP zero file path length")
 					break
 				}
 
@@ -562,10 +720,25 @@ WHERE uid = ? AND file_path = ?;
 					break
 				}
 
+				// 使用事务更新数据库
+				sessionDB := database.Engine.NewSession()
+				if err := sessionDB.Begin(); err != nil {
+					logger.Error("KCP failed to start transaction:", err)
+					break
+				}
+
 				var fileDownloads database.Downloads
-				if _, err := database.Engine.Where("uid = ? AND file_path = ?", uid, filePath).Get(&fileDownloads); err == nil {
+				if _, err := sessionDB.Where("uid = ? AND file_path = ?", uid, filePath).Get(&fileDownloads); err == nil {
 					fileDownloads.DownloadedSize += len(fileContent)
-					database.Engine.Where("uid = ? AND file_path = ?", uid, filePath).Update(&fileDownloads)
+					if _, err := sessionDB.Where("uid = ? AND file_path = ?", uid, filePath).Update(&fileDownloads); err != nil {
+						sessionDB.Rollback()
+						logger.Error("KCP failed to update downloads:", err)
+						break
+					}
+				}
+
+				if err := sessionDB.Commit(); err != nil {
+					logger.Error("KCP failed to commit transaction:", err)
 				}
 
 				// 确保目录存在
@@ -581,18 +754,20 @@ WHERE uid = ? AND file_path = ?;
 					logger.Error("KCP failed to open file:", err)
 					break
 				}
+				defer fp.Close()
 
 				if _, err := fp.Write(fileContent); err != nil {
 					logger.Error("KCP failed to write file content:", err)
 				}
-				fp.Close()
 
 			case command.DRIVES:
-				drives := utils.GetExistingDrives(data)
-				command.VarDrivesQueue.Add(uid, drives)
+				if len(data) > 0 {
+					drives := utils.GetExistingDrives(data)
+					command.VarDrivesQueue.Add(uid, drives)
+				}
 
 			case command.FileContent:
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
 					logger.Error("KCP file content data too short")
 					break
 				}
@@ -600,6 +775,11 @@ WHERE uid = ? AND file_path = ?;
 				filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 				if len(data) < 4+filePathLen {
 					logger.Error("KCP invalid file path length in file content")
+					break
+				}
+
+				if filePathLen == 0 {
+					logger.Error("KCP zero file path length")
 					break
 				}
 
@@ -622,17 +802,27 @@ WHERE uid = ? AND file_path = ?;
 			}
 
 		case 3: // heartBeat
+			if len(message) < 5 { // 至少需要类型+1字节数据
+				logger.Error("KCP heartBeat message too short from:", remoteAddr)
+				break
+			}
+
 			msg := message[4:]
+			if len(msg) == 0 {
+				logger.Error("KCP empty heartBeat payload from:", remoteAddr)
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(msg)
 			if err != nil {
 				logger.Error("KCP DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
 				logger.Error("KCP Decrypt failed:", err)
-				continue
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -644,7 +834,8 @@ WHERE uid = ? AND file_path = ?;
 			}
 
 		default:
-			logger.Warn("KCP unknown message type:", msgType)
+			logger.Warn("KCP unknown message type:", msgType, "from:", remoteAddr)
+			break
 		}
 	}
 }
@@ -695,14 +886,27 @@ func SendToClient(uid string, message []byte) error {
 
 // BroadcastToAll 广播消息给所有KCP客户端
 func BroadcastToAll(message []byte) {
+	if len(message) == 0 {
+		logger.Error("KCP empty message for broadcast")
+		return
+	}
+
 	globalKCPClientManager.Mu.RLock()
 	defer globalKCPClientManager.Mu.RUnlock()
+
+	successCount := 0
+	failCount := 0
 
 	for uid, client := range globalKCPClientManager.Clients {
 		if !client.IsClosed {
 			if err := client.Write(message); err != nil {
 				logger.Error("KCP failed to broadcast to client:", uid, "Error:", err)
+				failCount++
+			} else {
+				successCount++
 			}
 		}
 	}
+
+	logger.Info("KCP broadcast completed, success:", successCount, "failed:", failCount)
 }

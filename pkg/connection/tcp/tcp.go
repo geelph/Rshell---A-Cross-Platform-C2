@@ -209,17 +209,21 @@ func HandleTcpConnection(conn net.Conn) {
 		StopChan:      make(chan struct{}),
 		LastHeartbeat: time.Now(),
 		IsClosed:      false,
-		Reader:        bufio.NewReader(conn),
+		Reader:        bufio.NewReaderSize(conn, 1024*1024), // 增加缓冲区大小
 	}
 
 	defer func() {
+		// 异常恢复
+		if r := recover(); r != nil {
+			logger.Error("TCP handler panic recovered:", r, "from:", conn.RemoteAddr())
+		}
 		// 确保连接被关闭
 		client.Close()
 		logger.Info("TCP handler finished for:", conn.RemoteAddr())
 	}()
 
 	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(60 * time.Second))
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	// 主消息处理循环
 	for {
@@ -228,9 +232,9 @@ func HandleTcpConnection(conn net.Conn) {
 		}
 
 		// 重置读取超时
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-		// 读取消息长度
+		// 1. 读取消息长度 - 添加更严格的检查
 		var length uint32
 		err := binary.Read(client.Reader, binary.BigEndian, &length)
 		if err != nil {
@@ -238,8 +242,8 @@ func HandleTcpConnection(conn net.Conn) {
 				logger.Info("Client closed connection:", conn.RemoteAddr())
 			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				logger.Info("TCP read timeout for:", conn.RemoteAddr())
-				// 继续等待
-				continue
+				// 可以添加心跳检查或直接断开
+				break
 			} else {
 				logger.Error("Error reading message length:", err, "from:", conn.RemoteAddr())
 			}
@@ -247,50 +251,77 @@ func HandleTcpConnection(conn net.Conn) {
 		}
 
 		// 验证消息长度（防止恶意攻击）
-		if length > 10*1024*1024 { // 限制为10MB
-			logger.Error("Message too large:", length, "from:", conn.RemoteAddr())
-			break
-		}
-
 		if length == 0 {
 			logger.Warn("Received zero-length message from:", conn.RemoteAddr())
 			continue
 		}
 
-		// 读取消息内容
+		// 更严格的长度限制
+		if length > 10*1024*1024 { // 限制为10MB
+			logger.Error("Message too large:", length, "from:", conn.RemoteAddr())
+			// 发送错误响应并断开
+			break
+		}
+
+		// 最小长度检查（至少需要4字节的消息类型）
+		if length < 4 {
+			logger.Error("Message length too short:", length, "from:", conn.RemoteAddr())
+			break
+		}
+
+		// 2. 读取消息内容 - 使用带限制的读取
 		message := make([]byte, length)
-		_, err = io.ReadFull(client.Reader, message)
+		bytesRead, err := io.ReadFull(client.Reader, message)
 		if err != nil {
 			if err == io.EOF {
 				logger.Info("Client closed connection while reading:", conn.RemoteAddr())
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				logger.Info("TCP read content timeout for:", conn.RemoteAddr())
 			} else {
 				logger.Error("Error reading message content:", err, "from:", conn.RemoteAddr())
 			}
 			break
 		}
 
-		// 处理消息
-		if len(message) < 4 {
-			logger.Error("Message too short from:", conn.RemoteAddr())
-			continue
+		// 验证实际读取的字节数
+		if uint32(bytesRead) != length {
+			logger.Error("Message length mismatch, expected:", length, "actual:", bytesRead)
+			break
 		}
 
-		msgTypeBytes := message[:4]
-		msgType := binary.BigEndian.Uint32(msgTypeBytes)
+		// 3. 解析消息类型 - 添加边界检查
+		msgType := binary.BigEndian.Uint32(message[:4])
 
+		// 处理消息
 		switch msgType {
 		case 1: // firstBlood
+			if len(message) < 5 { // 至少需要类型+1字节数据
+				logger.Error("FirstBlood message too short from:", conn.RemoteAddr())
+				break
+			}
+
 			msg := message[4:]
+			if len(msg) == 0 {
+				logger.Error("Empty FirstBlood payload from:", conn.RemoteAddr())
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(msg)
 			if err != nil {
-				logger.Error("DecodeBase64 failed:", err)
-				continue
+				logger.Error("DecodeBase64 failed:", err, "from:", conn.RemoteAddr())
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
-				logger.Error("Decrypt failed:", err)
-				continue
+				logger.Error("Decrypt failed:", err, "from:", conn.RemoteAddr())
+				break
+			}
+
+			// 验证metainfo长度
+			if len(metainfo) < 9 {
+				logger.Error("Metainfo too short:", len(metainfo), "from:", conn.RemoteAddr())
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -314,13 +345,37 @@ func HandleTcpConnection(conn net.Conn) {
 			exists, _ := database.Engine.Where("uid = ?", uid).Get(&existingClient)
 
 			if !exists { // FirstBlood
+				if len(metainfo) < 9 {
+					logger.Error("Metainfo too short for parsing:", conn.RemoteAddr())
+					break
+				}
+
 				processID := binary.BigEndian.Uint32(metainfo[:4])
-				flag := int(metainfo[4:5][0])
+				flag := int(metainfo[4])
+
+				// 检查是否有足够字节解析IP
+				if len(metainfo) < 9 {
+					logger.Error("Metainfo insufficient for IP parsing:", conn.RemoteAddr())
+					break
+				}
+
 				ipInt := binary.LittleEndian.Uint32(metainfo[5:9])
 				localIP := utils.Uint32ToIP(ipInt).String()
-				osInfo := string(metainfo[9:])
 
+				// 安全地获取osInfo
+				var osInfo string
+				if len(metainfo) > 9 {
+					osInfo = string(metainfo[9:])
+				}
+
+				// 验证osInfo格式
 				osArray := strings.Split(osInfo, "\t")
+				if len(osArray) != 3 {
+					logger.Error("Invalid osInfo format, expected 3 parts, got:", len(osArray), "from:", conn.RemoteAddr())
+					// 设置默认值防止崩溃
+					osArray = []string{"Unknown", "Unknown", "Unknown"}
+				}
+
 				hostName := osArray[0]
 				UserName := osArray[1]
 				processName := osArray[2]
@@ -390,31 +445,49 @@ func HandleTcpConnection(conn net.Conn) {
 			}
 
 		case 2: // otherMsg
+			if len(message) < 8 { // 至少需要类型+4字节长度+部分数据
+				logger.Error("OtherMsg message too short from:", conn.RemoteAddr())
+				break
+			}
+
 			msg := message[4:]
 			if len(msg) < 4 {
 				logger.Error("OtherMsg too short")
-				continue
+				break
 			}
 
 			metaLen := binary.BigEndian.Uint32(msg[:4])
-			if len(msg) < int(4+metaLen) {
-				logger.Error("Invalid meta length")
-				continue
+
+			// 验证metaLen
+			if metaLen > uint32(len(msg)-4) {
+				logger.Error("Invalid meta length:", metaLen, "available:", len(msg)-4)
+				break
+			}
+
+			if metaLen == 0 {
+				logger.Error("Zero meta length")
+				break
 			}
 
 			metaMsg := msg[4 : 4+metaLen]
 			realMsg := msg[4+metaLen:]
 
+			// 验证realMsg不为空
+			if len(realMsg) == 0 {
+				logger.Error("Empty real message")
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(metaMsg)
 			if err != nil {
 				logger.Error("DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
 				logger.Error("Decrypt failed:", err)
-				continue
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -422,65 +495,78 @@ func HandleTcpConnection(conn net.Conn) {
 			// 检查客户端是否在线
 			if _, exists := globalTCPClientManager.Get(uid); !exists {
 				logger.Warn("Received message from offline TCP client:", uid)
-				continue
+				break
 			}
 
 			dataBytes, err := encrypt.DecodeBase64(realMsg)
 			if err != nil {
 				logger.Error("DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			dataBytes, err = encrypt.Decrypt(dataBytes)
 			if err != nil {
 				logger.Error("First decrypt failed:", err)
-				continue
+				break
 			}
 
 			dataBytes, err = encrypt.Decrypt(dataBytes)
 			if err != nil {
 				logger.Error("Second decrypt failed:", err)
-				continue
+				break
 			}
 
+			// 修复的关键点：严格检查dataBytes长度
 			if len(dataBytes) < 4 {
-				logger.Error("Decrypted data too short")
-				continue
+				logger.Error("Decrypted data too short:", len(dataBytes))
+				break
 			}
 
 			replyTypeBytes := dataBytes[:4]
 			data := dataBytes[4:]
 			replyType := binary.BigEndian.Uint32(replyTypeBytes)
 
+			// 根据replyType进行不同的边界检查
 			switch replyType {
-			case 0: // 命令行展示
+			case 0, 31: // 命令行展示或错误展示
 				var shell database.Shell
 				if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-					shell.ShellContent += string(data) + "\n"
-					database.Engine.Where("uid = ?", uid).Update(&shell)
-				}
-
-			case 31: // 错误展示
-				var shell database.Shell
-				if _, err := database.Engine.Where("uid = ?", uid).Get(&shell); err == nil {
-					shell.ShellContent += "!Error: " + string(data) + "\n"
+					if replyType == 31 {
+						shell.ShellContent += "!Error: "
+					}
+					if len(data) > 0 {
+						shell.ShellContent += string(data) + "\n"
+					}
 					database.Engine.Where("uid = ?", uid).Update(&shell)
 				}
 
 			case command.PS:
-				command.VarPidQueue.Add(uid, string(data))
+				if len(data) > 0 {
+					command.VarPidQueue.Add(uid, string(data))
+				}
 
 			case command.FileBrowse:
-				command.VarFileBrowserQueue.Add(uid, string(data))
+				if len(data) > 0 {
+					command.VarFileBrowserQueue.Add(uid, string(data))
+				}
 
 			case 22: // 文件下载第一条信息
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节长度+部分路径
 					logger.Error("File download info too short")
 					break
 				}
 
 				fileLen := int(binary.BigEndian.Uint32(data[:4]))
+				if len(data) < 4 {
+					logger.Error("No file path in download info")
+					break
+				}
+
 				filePath := string(data[4:])
+				if filePath == "" {
+					logger.Error("Empty file path")
+					break
+				}
 
 				// 使用安全路径函数
 				fullPath, err := utils.GetSafeFilePath(uid, filePath)
@@ -524,7 +610,7 @@ WHERE uid = ? AND file_path = ?;
 				fp.Close()
 
 			case command.DOWNLOAD: // 文件下载
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
 					logger.Error("Download data too short")
 					break
 				}
@@ -532,6 +618,11 @@ WHERE uid = ? AND file_path = ?;
 				filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 				if len(data) < 4+filePathLen {
 					logger.Error("Invalid file path length in download")
+					break
+				}
+
+				if filePathLen == 0 {
+					logger.Error("Zero file path length")
 					break
 				}
 
@@ -571,11 +662,13 @@ WHERE uid = ? AND file_path = ?;
 				fp.Close()
 
 			case command.DRIVES:
-				drives := utils.GetExistingDrives(data)
-				command.VarDrivesQueue.Add(uid, drives)
+				if len(data) > 0 {
+					drives := utils.GetExistingDrives(data)
+					command.VarDrivesQueue.Add(uid, drives)
+				}
 
 			case command.FileContent:
-				if len(data) < 4 {
+				if len(data) < 8 { // 至少4字节路径长度+部分路径+部分内容
 					logger.Error("File content data too short")
 					break
 				}
@@ -583,6 +676,11 @@ WHERE uid = ? AND file_path = ?;
 				filePathLen := int(binary.BigEndian.Uint32(data[:4]))
 				if len(data) < 4+filePathLen {
 					logger.Error("Invalid file path length in file content")
+					break
+				}
+
+				if filePathLen == 0 {
+					logger.Error("Zero file path length")
 					break
 				}
 
@@ -605,17 +703,27 @@ WHERE uid = ? AND file_path = ?;
 			}
 
 		case 3: // heartBeat
+			if len(message) < 5 { // 至少需要类型+1字节数据
+				logger.Error("HeartBeat message too short from:", conn.RemoteAddr())
+				break
+			}
+
 			msg := message[4:]
+			if len(msg) == 0 {
+				logger.Error("Empty HeartBeat payload from:", conn.RemoteAddr())
+				break
+			}
+
 			tmpMetainfo, err := encrypt.DecodeBase64(msg)
 			if err != nil {
 				logger.Error("DecodeBase64 failed:", err)
-				continue
+				break
 			}
 
 			metainfo, err := encrypt.Decrypt(tmpMetainfo)
 			if err != nil {
 				logger.Error("Decrypt failed:", err)
-				continue
+				break
 			}
 
 			uid := encrypt.BytesToMD5(metainfo)
@@ -627,7 +735,9 @@ WHERE uid = ? AND file_path = ?;
 			}
 
 		default:
-			logger.Warn("Unknown TCP message type:", msgType)
+			logger.Warn("Unknown TCP message type:", msgType, "from:", conn.RemoteAddr())
+			// 可以选择断开连接或继续
+			break
 		}
 	}
 }
