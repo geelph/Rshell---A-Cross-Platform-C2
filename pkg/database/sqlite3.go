@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"reflect"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -12,7 +13,7 @@ import (
 )
 
 var Engine *xorm.Engine
-var DatabaseName string = "./database.db"
+var DatabaseName string
 
 type Users struct {
 	Username string
@@ -89,6 +90,18 @@ type Key struct {
 
 func ConnectDateBase() {
 	var err error
+	// 获取当前程序所在目录
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("获取程序路径失败: %v", err)
+	}
+
+	// 获取程序所在目录
+	exeDir := filepath.Dir(exePath)
+
+	// 设置数据库路径为程序所在目录下的 database.db
+	DatabaseName = filepath.Join(exeDir, "database.db")
+
 	Engine, err = xorm.NewEngine("sqlite3", DatabaseName)
 	if err != nil {
 		log.Fatalf("连接sqlite3数据库失败: %v", err)
