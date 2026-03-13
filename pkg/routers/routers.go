@@ -124,6 +124,7 @@ func NewRouter(embedFS embed.FS, staticFs fs.FS) *gin.Engine {
 	}
 
 	protected.POST("/bin/execute", api.ExecuteBin)
+	protected.POST("/bin/executelinuxscript", api.ExecuteLinuxScript)
 
 	shellcode := protected.Group("/shellcode")
 	{

