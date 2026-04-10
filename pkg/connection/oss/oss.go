@@ -225,7 +225,10 @@ func (c *OSSClient) pollMessages() ([]string, error) {
 	var keys []string
 
 	// 列出所有client相关的key
-	objects := List(Service)
+	objects, err := List(Service)
+	if err != nil {
+		return nil, err
+	}
 	for _, obj := range objects {
 		if strings.Contains(obj.Key, "client") {
 			keys = append(keys, obj.Key)
@@ -324,7 +327,9 @@ func (c *OSSClient) processSingleMessage(key string) error {
 	}
 
 	// 删除已处理的消息
-	Del(Service, key)
+	if err := Del(Service, key); err != nil {
+		logger.Error("Failed to delete message:", key, err)
+	}
 
 	// 处理消息
 	return processMessage(message)

