@@ -1,0 +1,66 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        cache: true
+    
+    - name: Tidy and verify modules
+      run: |
+        go mod tidy
+        go mod verify
+    
+    - name: Build for Linux (amd64)
+      run: |
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          -ldflags="-w -s" \
+          -trimpath \
+          -o Rshell_linux_amd64 main.go
+    
+    - name: Build for Windows (amd64)
+      run: |
+        CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
+          -ldflags="-w -s" \
+          -trimpath \
+          -o Rshell_windows_amd64.exe main.go
+    
+    - name: Build for macOS (amd64)
+      run: |
+        CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
+          -ldflags="-w -s" \
+          -trimpath \
+          -o Rshell_darwin_amd64 main.go
+    
+    - name: Build for macOS (arm64)
+      run: |
+        CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+          -ldflags="-w -s" \
+          -trimpath \
+          -o Rshell_darwin_arm64 main.go
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          Rshell_linux_amd64
+          Rshell_windows_amd64.exe
+          Rshell_darwin_amd64
+          Rshell_darwin_arm64
+        generate_release_notes: true
+        name: Release ${{ github.ref_name }}
