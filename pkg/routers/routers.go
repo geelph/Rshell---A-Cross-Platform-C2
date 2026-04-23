@@ -132,6 +132,14 @@ func NewRouter(embedFS embed.FS, staticFs fs.FS) *gin.Engine {
 		shellcode.POST("/stage", api.StageShellCodeGen)
 	}
 
+	plugin := protected.Group("/plugin")
+	{
+		plugin.GET("/list", api.ListPlugins)
+		plugin.POST("/add", api.AddPlugin)
+		plugin.POST("/delete", api.DeletePlugin)
+		plugin.POST("/execute", api.ExecutePlugin)
+	}
+
 	// WebSocket认证token获取端点 - 需要JWT认证
 	protected.GET("/ws/auth/:uid", api.GetWebSocketAuthToken)
 
