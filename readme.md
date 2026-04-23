@@ -155,6 +155,16 @@ windows内存执行 支持Execute Assembly(.net程序内存执行)、Inline Bin(
 
 ![image-20260206173424252](./assets/image-20260206173424252.png)
 
+## 插件管理
+
+新增插件：
+
+![image-20260423102325331](./assets/image-20260423102325331.png)
+
+调用插件：
+
+![image-20260423102406659](./assets/image-20260423102406659.png)
+
 # ToDoList
 
 **目前有一些待实现的改进想法，将不定期更新。如果你有好的建议或想参与开发，欢迎提交 PR 或开 issue 讨论。**
@@ -170,8 +180,8 @@ windows内存执行 支持Execute Assembly(.net程序内存执行)、Inline Bin(
 - [ ] 一键信息收集，收集信息内容直接保存到笔记中
 - [ ] 丰富上线提醒的方式（邮箱、钉钉、telegram等）
 - [x] 增加正向上线方式 [#26](https://github.com/Rubby2001/Rshell---A-Cross-Platform-C2/issues/26)
-- [ ] 增加插件模块  [#9](https://github.com/Rubby2001/Rshell---A-Cross-Platform-C2/issues/9)
-- [ ] 增加开机启动等插件是否合适  [#9](https://github.com/Rubby2001/Rshell---A-Cross-Platform-C2/issues/9)
+- [x] 增加插件模块  [#9](https://github.com/Rubby2001/Rshell---A-Cross-Platform-C2/issues/9)
+- [x] 增加开机启动等插件是否合适  [#9](https://github.com/Rubby2001/Rshell---A-Cross-Platform-C2/issues/9) (可借助插件模块实现)
 - [x] 通讯流量实现自定义配置或随机密钥，增加逆向解密难度
 
 # 相关项目
@@ -198,5 +208,4 @@ windows内存执行 支持Execute Assembly(.net程序内存执行)、Inline Bin(
    - 不会危害关键信息基础设施
 5. 开发者不承诺工具的隐蔽性、稳定性或适用性，不承担因使用本工具导致的任何直接或间接责任。
 6. 下载、使用本项目即表示您已充分阅读并同意本声明所有条款。
-
 
