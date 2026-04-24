@@ -183,6 +183,20 @@ func ConnectDateBase() {
 			os.Exit(0)
 		}
 	}
+
+	var mcpSetting Settings
+	exists, err = Engine.Where("name=?", "mcp_enabled").Get(&mcpSetting)
+	if !exists {
+		defaultMcpSetting := &Settings{
+			Name:  "mcp_enabled",
+			Value: "false",
+		}
+		err = InsertData(Engine, defaultMcpSetting)
+		if err != nil {
+			logger.Error(err.Error())
+			os.Exit(0)
+		}
+	}
 }
 
 // InsertData 函数用于插入任意表的数据

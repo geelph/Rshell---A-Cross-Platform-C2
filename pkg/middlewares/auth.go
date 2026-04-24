@@ -61,32 +61,41 @@ func BasicAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// AuthMiddleware validates JWT from Authorization2.
+// AuthMiddleware validates JWT from Authorization2 or query token.
 func AuthMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		authHeader := strings.TrimSpace(c.GetHeader("Authorization2"))
+        return func(c *gin.Context) {
+                authHeader := strings.TrimSpace(c.GetHeader("Authorization2"))
+                // 支持URL查询参数传递token，方便SSE之类的客户端
+                if authHeader == "" {
+                        queryToken := c.Query("token")
+                        if queryToken != "" {
+                                authHeader = "Bearer " + queryToken
+                        }
+                }
+
 		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token required"})
+			c.String(http.StatusUnauthorized, "Token required")
 			c.Abort()
 			return
 		}
 
 		if len(authHeader) < len("Bearer ") || !strings.EqualFold(authHeader[:len("Bearer ")], "Bearer ") {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format"})
+			c.String(http.StatusUnauthorized, "Invalid token format")
 			c.Abort()
 			return
 		}
 
 		tokenString := strings.TrimSpace(authHeader[len("Bearer "):])
 		if tokenString == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token required"})
+			c.String(http.StatusUnauthorized, "Token required")
 			c.Abort()
 			return
 		}
 
 		claims, err := common.ValidateJWT(tokenString)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			// MCP SDK 期望标准的文本错误，避免抛出解析异常
+			c.String(http.StatusUnauthorized, "Invalid token")
 			c.Abort()
 			return
 		}
