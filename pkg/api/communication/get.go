@@ -412,9 +412,7 @@ func handleFirstBlood(uid string, metainfo []byte, r *http.Request) error {
 	}
 
 	// 发送Webhook通知
-	if exists, key := webhooks.CheckEnable(); exists {
-		webhooks.SendWecom(*client, key)
-	}
+	go webhooks.NotifyOnline(*client)
 
 	// 添加到客户端管理器
 	globalHTTPClientManager.Add(uid, 5)

@@ -170,17 +170,26 @@ func ConnectDateBase() {
 		logger.Warnf("account: %s", "admin")
 		logger.Warnf("password: %s", initialPassword)
 	}
-	var Setting Settings
-	exists, err = Engine.Where("name=?", "wecom").Get(&Setting)
-	if !exists {
-		defaultSetting := &Settings{
-			Name:  "wecom",
-			Value: "",
-		}
-		err = InsertData(Engine, defaultSetting)
-		if err != nil {
-			logger.Error(err.Error())
-			os.Exit(0)
+	defaultSettings := map[string]string{
+		"wecom":    "{}", // Changed to json format to support multiple options like URL and enabled, but keeping compatible as much as possible
+		"dingtalk": "{}",
+		"telegram": "{}",
+		"email":    "{}",
+	}
+
+	for k, v := range defaultSettings {
+		var Setting Settings
+		exists, err = Engine.Where("name=?", k).Get(&Setting)
+		if !exists {
+			defaultSetting := &Settings{
+				Name:  k,
+				Value: v,
+			}
+			err = InsertData(Engine, defaultSetting)
+			if err != nil {
+				logger.Error(err.Error())
+				os.Exit(0)
+			}
 		}
 	}
 

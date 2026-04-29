@@ -500,9 +500,7 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 				}
 
 				// 发送Webhook通知
-				if exists, key := webhooks.CheckEnable(); exists {
-					webhooks.SendWecom(c, key)
-				}
+				go webhooks.NotifyOnline(c)
 
 				logger.Info("New KCP client registered:", uid, "IP:", externalIp)
 			} else {

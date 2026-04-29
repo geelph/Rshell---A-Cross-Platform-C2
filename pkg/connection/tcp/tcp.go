@@ -437,9 +437,7 @@ func HandleTcpConnection(conn net.Conn) {
 				database.Engine.Insert(&database.Notes{Uid: uid, Note: ""})
 
 				// 发送Webhook通知
-				if exists, key := webhooks.CheckEnable(); exists {
-					webhooks.SendWecom(c, key)
-				}
+				go webhooks.NotifyOnline(c)
 
 				logger.Info("New TCP client registered:", uid, "IP:", externalIp)
 			} else {

@@ -434,9 +434,7 @@ func (fc *ForwardConnector) forwardMessageToHandler(message []byte) {
 			database.Engine.Insert(&database.Notes{Uid: uid, Note: ""})
 
 			// 发送Webhook通知
-			if exists, key := webhooks.CheckEnable(); exists {
-				webhooks.SendWecom(c, key)
-			}
+			go webhooks.NotifyOnline(c)
 
 			logger.Info("New client registered via forward connection:", uid, "IP:", externalIp)
 		} else {

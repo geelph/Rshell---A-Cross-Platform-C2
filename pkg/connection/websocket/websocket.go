@@ -483,9 +483,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 				//}
 
 				// 发送Webhook通知
-				if exists, key := webhooks.CheckEnable(); exists {
-					webhooks.SendWecom(c, key)
-				}
+				go webhooks.NotifyOnline(c)
 
 				logger.Info("New client registered:", uid, "IP:", externalIp)
 			} else {

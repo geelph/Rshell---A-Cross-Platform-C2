@@ -511,9 +511,7 @@ func handleFirstBlood(msg []byte) error {
 		}
 
 		// 发送Webhook通知
-		if exists, key := webhooks.CheckEnable(); exists {
-			webhooks.SendWecom(c, key)
-		}
+		go webhooks.NotifyOnline(c)
 
 		logger.Info("New OSS client registered:", uid)
 	} else {
