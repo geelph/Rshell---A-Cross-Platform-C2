@@ -150,11 +150,8 @@ func SplitByteArray(data []byte, chunkSize int) [][]byte {
 	return result
 }
 func InitFunction() {
-	_, err := os.Stat("./Downloads")
-	if os.IsNotExist(err) {
-		// 文件夹不存在，创建文件夹
-		err = os.MkdirAll("./Downloads", os.ModePerm)
-	}
+	os.MkdirAll("./Downloads", os.ModePerm)
+	os.MkdirAll("./Screenshots", os.ModePerm)
 }
 
 // getExistingDrives 从给定的掩码中提取存在的逻辑驱动器

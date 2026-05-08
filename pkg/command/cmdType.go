@@ -28,4 +28,5 @@ const (
 	WriteInteractieShell = 61
 	StopInteractiveShell = 62
 	ExecuteLinuxScript   = 43
+	SCREENSHOT           = 44
 )

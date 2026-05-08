@@ -96,6 +96,13 @@ type Plugin struct {
 	FilePath   string
 	UploadTime int64
 }
+type Screenshots struct {
+	Id        int64  `xorm:"pk autoincr"`
+	Uid       string
+	FileName  string
+	FilePath  string
+	CreatedAt int64
+}
 
 func generateInitialAdminPassword(length int) (string, error) {
 	if length <= 0 {
@@ -135,7 +142,7 @@ func ConnectDateBase() {
 	if err != nil {
 		logger.Fatalf("连接sqlite数据库失败: %v", err)
 	}
-	err = Engine.Sync2(new(Users), new(Clients), new(Notes), new(Shell), new(Downloads), new(Listener), new(WebDelivery), new(Socks5), new(Settings), new(Key), new(Plugin))
+	err = Engine.Sync2(new(Users), new(Clients), new(Notes), new(Shell), new(Downloads), new(Listener), new(WebDelivery), new(Socks5), new(Settings), new(Key), new(Plugin), new(Screenshots))
 	if err != nil {
 		logger.Fatalf("初始化数据库失败: %v", err)
 	}

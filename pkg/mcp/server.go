@@ -505,6 +505,44 @@ func InitMCP() {
 	// ---------------------------------------------------------
 	// 万能网关回调（高级工具），以便执行那些未明确注册的临时接口
 	// ---------------------------------------------------------
+	// ---------------------------------------------------------
+	// Screenshot 工具
+	// ---------------------------------------------------------
+	MCPServer.AddTool(mcp.NewTool("capture_screenshot",
+		mcp.WithDescription("Request a screenshot from the target client. Use list_screenshots to retrieve previously captured images."),
+		mcp.WithString("target", mcp.Required(), mcp.Description("The target client (UID, part of UID, Internal IP, External IP, or Note)")),
+	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := request.Params.Arguments.(map[string]interface{})
+		uid, err := resolveClientUID(args["target"].(string))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		body := map[string]interface{}{"uid": uid}
+		resp, err := localApiCall("POST", "/api/client/screenshot/capture", nil, body)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(resp), nil
+	})
+
+	MCPServer.AddTool(mcp.NewTool("list_screenshots",
+		mcp.WithDescription("List previously captured screenshots for a target client."),
+		mcp.WithString("target", mcp.Required(), mcp.Description("The target client (UID, part of UID, Internal IP, External IP, or Note)")),
+	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := request.Params.Arguments.(map[string]interface{})
+		uid, err := resolveClientUID(args["target"].(string))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		resp, err := localApiCall("GET", "/api/client/screenshot/list", map[string]string{"uid": uid}, nil)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(resp), nil
+	})
+
 	MCPServer.AddTool(mcp.NewTool("advanced_http_post",
 		mcp.WithDescription("Advanced: Send raw JSON payload to a specific POST endpoint."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Relative internal API path (e.g. /api/forward-connection)")),

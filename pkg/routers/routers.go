@@ -94,6 +94,9 @@ func NewRouter(embedFS embed.FS, staticFs fs.FS) *gin.Engine {
 		clients.POST("/color", api.EditColor)
 		clients.POST("/GenServer", api.GenServer)
 		clients.GET("/listener/list", api.ShowListener)
+		clients.POST("/screenshot/capture", api.CaptureScreenshot)
+		clients.GET("/screenshot/list", api.ListScreenshots)
+		clients.GET("/screenshot/image", api.GetScreenshotImage)
 	}
 
 	listeners := protected.Group("/listener")
