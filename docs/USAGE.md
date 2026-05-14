@@ -88,6 +88,35 @@ shell + [cmd]
 
 ![image-20260206170443496](../assets/image-20260206170443496.png)
 
+### 敏感信息搜索
+
+递归扫描指定路径下的配置文件、脚本、源码等，匹配其中的密码、密钥、令牌、JDBC 连接字符串等敏感信息。
+
+**内置检测规则**：
+
+| 规则 | 匹配内容 |
+|------|---------|
+| 云密钥 | `accessKeyId`, `accessKeySecret` |
+| 口令/密码 | `password=`, `passwd=`, `密码=` |
+| 用户名 | `username=`, `user=`, `用户名=` |
+| JDBC | `jdbc.driver=`, `jdbc.url=` |
+| 腾讯云 IM | `sdkappid`, `privateKey`, `identifier` |
+
+**扫描的文件类型**：`.env`, `.conf`, `.json`, `.ini`, `.xml`, `.yaml`, `.yml`, `.sql`, `.properties`, `.config`, `.txt`, `.md`
+
+**使用方式**：
+
+1. 在 Shell 页面点击 **"敏感搜索"** 按钮
+2. 输入要扫描的路径（例如 `/home/user` 或 `C:\Users\admin`）
+3. 点击"开始搜索"，结果实时流式返回并在 Shell 中显示
+4. 或点击顶部导航栏的 **"敏感搜索"** 进入独立视图查看所有搜索结果
+
+
+
+![image-20260514165528261](./assets/image-20260514165528261.png)
+
+---
+
 ## Windows相关
 
 ### shellcode生成：
@@ -206,6 +235,64 @@ pip install pypykatz
 
 
 
+---
+
+
+
+## Linux 相关
+
+### Linux 脚本执行
+
+上传 `.sh` 脚本文件，植入端通过 `sh -s` 从 stdin 管道执行，无文件落地
+
+### Linux 内存执行
+
+上传 ELF 二进制文件，植入端将其写入 `/tmp/.*` → chmod +x → 执行 → **进程运行中立即删除临时文件**（利用 Linux 已运行程序可以从磁盘删除的特性）。
+
+![image-20260514165122704](./assets/image-20260514165122704.png)
+
+**使用场景**：上传 fscan 等 Linux 工具，执行后不留磁盘痕迹。
+
+---
+
+## Windows 浏览器密码抓取
+
+支持抓取以下浏览器的密码、Cookie、历史记录和信用卡信息：
+
+| 浏览器 | 密码 | Cookie | 说明 |
+|--------|------|--------|------|
+| Chrome | ✓ | ✓ | 支持 V10(DPAPI) + V20(ABE) |
+| Chrome Beta | ✓ | ✓ | |
+| Edge | ✓ | ✓ | 支持 ABE |
+| Firefox | ✓ | ✓ | NSS PBE 解密 |
+| 360 安全浏览器 | ✓ | ✓ | 旧版 Chromium，DPAPI |
+| 360 极速浏览器 X | ✓ | ✓ | |
+| QQ 浏览器 | ✓ | ✓ | |
+| 搜狗浏览器 | ✓ | ✓ | |
+| Opera / Opera GX | ✓ | ✓ | |
+| Brave | ✓ | ✓ | |
+| Vivaldi | ✓ | ✓ | |
+| Chromium | ✓ | ✓ | |
+
+**使用方式**：
+
+1. 在客户端 Shell 页面顶部的导航栏中点击 **"浏览器密码"** 进入独立视图
+2. 点击 **"开始抓取"** 按钮
+3. 等待植入端扫描所有已安装浏览器并解密数据（约 10-60 秒）
+4. 结果按浏览器分组展示在折叠面板中，支持展开查看密码表、Cookie 表、历史记录
+
+**技术原理**：
+
+- **V10 解密**：从 `Local State` 读取 `os_crypt.encrypted_key` → Base64 解码 → 去掉 `DPAPI` 前缀 → `CryptUnprotectData` → AES-256-GCM 解密每条记录
+- **V20 解密（Chrome 127+）**：读取 `os_crypt.app_bound_encrypted_key` → 通过远程线程注入到浏览器进程获取 ABE 密钥 → AES-GCM 解密
+- **Firefox**：读取 `key4.db` + `logins.json` → NSS ASN1 PBE 解密
+
+![image-20260514165336321](./assets/image-20260514165336321.png)
+
+---
+
+
+
 ## 插件管理
 
 新增插件：
@@ -216,68 +303,39 @@ pip install pypykatz
 
 ![image-20260423102406659](../assets/image-20260423102406659.png)
 
-## MCP
-
-目前 Rshell 的 MCP (Model Context Protocol) 接口支持非常丰富的功能，涵盖了从基础配置到远控操作个维度的能力。以下是具体支持的功能列表：
-
-### 📡 1. 客户端管理 (Clients)
-
-- **获取客户端列表 (`list_clients`)**：列出所有上线、离线的客户端/Bots 基础信息。
-- **发送 Shell 命令 (`send_command`)**：向指定的客户端（基于 UID、IP 或备注）下发系统命令。
-- **读取 Shell 历史的内容 (`get_shell_content`)**：获取特定客户端上已执行 Shell 命令的历史回显内容。
-- **断开客户端 (`exit_client`)**：干净地退出或切断目标客户端连接。
-- **读写客户端备注 (`get_client_note` / `edit_client_note`)**：查看或修改某个客户端的备注信息。
-
-### ⚙️ 2. 进程控制 (Processes)
-
-- **获取进程列表 (`get_target_processes`)**：列出目标客户端上当前活跃的系统进程 (ps)。
-- **强杀进程 (`kill_pid`)**：根据 PID 终止目标客户端上的特定进程。
-
-### 📁 3. 文件系统操作 (File System)
-
-- **浏览文件系统 (`target_file_browse`)**：浏览目标客户端的文件和目录结构。
-- **读取文件内容 (`fetch_file_content`)**：读取目标磁盘上具体文件的文本内容。
-- **创建目录 (`make_dir`)**：在目标系统上新建文件夹。
-- **删除文件 (`file_delete`)**：删除目标系统上的特定文件。
-
-### 🎧 4. 监听器管理 (Listeners)
-
-- **列出监听器 (`list_listeners`)**：显示服务端当前配置的所有网络监听端口。
-- **新增监听器 (`add_listener`)**：在 C2 上添加基于 WebSocket、TCP、KCP、HTTP 或 OSS 的监听器。
-- **启停监听器 (`open_listener` / `close_listener`)**：开启被停止的监听器或临时关闭现有的监听器。
-- **删除监听器 (`delete_listener`)**：移除不再需要的监听器配置。
-
-### 🧩 5. 插件与代理 (Plugins & Proxies)
-
-- **查询可用插件 (`list_plugins`)**：列出服务端自带或安装的所有功能插件。
-- **执行插件 (`execute_plugin`)**：在目标客户端上执行指定的插件任务。
-- **查看 Socks5 代理 (`list_socks5`)**：列出所有由 Bot 发起且处于活动状态的 Socks5 代理信息。
-- **查看 Web 投递 (`list_web_delivery`)**：列出 WebDelivery (载荷分发) 相关的有效端点与状态。
-
-### 🛠️ 6. 全局设置与高级调试 (Settings & Advanced)
-
-- **获取全局设置 (`list_settings`)**：列出 C2 数据库中的全局配置或环境信息（如 Token 等）。
-- **修改全局设置 (`edit_settings`)**：编辑指定的参数值。
-- **内部接口调试 (`advanced_http_post`)**：支持发送原生 JSON 数据包给未注册的内部 POST 路由。
-
-这些支持均可以通过 AI 代理进行自动化调用底层工具直接操作，极大释放了无控制台下的远程网络管理能力。
-
-### 开启MCP功能：
-
-![9fddc4b3-2856-4354-9b76-7060221bb379](../assets/9fddc4b3-2856-4354-9b76-7060221bb379.png)
-
-### 列出客户端：
-
-![d23eb696-35b9-4b3b-adea-84e5d69bdd39](../assets/d23eb696-35b9-4b3b-adea-84e5d69bdd39.png)
-
-### 信息收集：
-
-![fdd77420-65d1-4ba7-964a-8978a9a1c04d](../assets/fdd77420-65d1-4ba7-964a-8978a9a1c04d.png)
-
-![981d7007-cb0a-4118-afbd-3596cd9c991f](../assets/981d7007-cb0a-4118-afbd-3596cd9c991f.png)
 
 ## 上线提醒
 
 支持多种上线提醒方式：
 
 ![image-20260429154521210](../assets/image-20260429154521210.png)
+
+---
+
+## Rshell-Skills（AI Agent 操控技能包）
+
+Rshell-Skills 是为 AI Agent（如 OpenCode、Cursor、Claude Code）提供的 C2 操控技能包，使 AI 能够通过自然语言交互完成对 Rshell 控制端的全量操作。
+
+**项目地址**：`https://github.com/Rubby2001/Rshell-Skills`
+
+**技能包含的内容**：
+
+| 章节 | 内容 | 适用场景 |
+|------|------|---------|
+| 认证与鉴权 | 登录流程、JWT Token 获取、Authorization2 头部传递 | 首次连接 Rshell API |
+| 完整 API 路由参考 | 69 个路由的 HTTP 方法、路径、输入/输出 JSON 格式 | AI 自动调用 API |
+| 通用客户端操作流程 | 命令执行、文件浏览下载、凭据抓取、后渗透 | 指导 AI 按步骤操作客户端 |
+| 常见问题 | Token 过期、超时、ABE 编译标记等 | 异常排查 |
+
+**使用方式**：
+
+在 AI 工具的配置中引用此技能：
+
+```yaml
+available_skills:
+  - name: rshell-c2
+    description: Rshell C2 框架控制端操作指南
+    location: https://raw.githubusercontent.com/Rubby2001/Rshell-Skills/master/SKILL.md
+```
+
+**效果**：AI 获得完整认证流程、API 路由表、客户端操作流程后，可自主完成登录 → 查看客户端 → 执行命令 → 抓取凭据等操作。
