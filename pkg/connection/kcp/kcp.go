@@ -261,6 +261,7 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 	// 这样可以保证在有丢包的情况下依然维持高吞吐
 	session.SetNoDelay(1, 20, 2, 1)
 	session.SetDeadline(time.Now().Add(60 * time.Second)) // 缩短超时时间
+	firstMessage := true
 
 	// 主消息处理循环
 	for {
@@ -268,8 +269,12 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 			break
 		}
 
-		// 重置读取超时
-		session.SetReadDeadline(time.Now().Add(30 * time.Second))
+		// 首次读取使用短超时(15s)快速清理僵尸连接
+		if firstMessage {
+			session.SetReadDeadline(time.Now().Add(15 * time.Second))
+		} else {
+			session.SetReadDeadline(time.Now().Add(30 * time.Second))
+		}
 
 		// 读取消息长度
 		var length uint32
@@ -278,13 +283,25 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 			if err == io.EOF {
 				logger.Info("KCP client closed connection:", remoteAddr)
 			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				logger.Info("KCP read timeout for:", remoteAddr)
-				continue
+				if firstMessage {
+					logger.Info("KCP firstBlood timeout, closing zombie connection:", remoteAddr)
+				} else {
+					logger.Info("KCP read timeout for:", remoteAddr)
+					continue
+				}
+			} else if strings.Contains(err.Error(), "timeout") {
+				if firstMessage {
+					logger.Info("KCP firstBlood timeout, closing zombie connection:", remoteAddr)
+				} else {
+					logger.Info("KCP read timeout for:", remoteAddr)
+					continue
+				}
 			} else {
 				logger.Error("KCP error reading message length:", err, "from:", remoteAddr)
 			}
 			break
 		}
+		firstMessage = false
 
 		// 验证消息长度
 		if length == 0 {
@@ -310,6 +327,8 @@ func HandleKCPConnection(session *kcp.UDPSession) {
 			if err == io.EOF {
 				logger.Info("KCP client closed connection while reading:", remoteAddr)
 			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				logger.Info("KCP read content timeout for:", remoteAddr)
+			} else if strings.Contains(err.Error(), "timeout") {
 				logger.Info("KCP read content timeout for:", remoteAddr)
 			} else {
 				logger.Error("KCP error reading message content:", err, "from:", remoteAddr)
